@@ -789,8 +789,14 @@ def compress_context(
     # eliminating the session-rotation bug cluster. Default False during rollout.
     in_place = bool(getattr(agent, "compression_in_place", False))
     # Set True once the in-place DB write actually completes (the DB block can
-    # raise and skip it). Surfaced to the gateway via agent._last_compaction_in_place.
+    # raise and skip it). Surfaced to callers via
+    # agent._last_compaction_in_place. Reset this per attempt: a previous
+    # successful compaction must never make a later failed attempt look
+    # committed (#fail-closed-in-place).
     compacted_in_place = False
+    agent._last_compaction_in_place = False
+    agent._last_compaction_db_error = None
+    agent._last_compaction_guard_error = None
     logger.info(
         "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
         agent.session_id or "none", _pre_msg_count,
@@ -1007,6 +1013,38 @@ def compress_context(
                 existing_prompt = agent._build_system_prompt(system_message)
             return messages, existing_prompt
 
+    def _existing_system_prompt() -> str:
+        """Return the pre-compression prompt for a fail-closed no-op."""
+        existing = getattr(agent, "_cached_system_prompt", None)
+        if not existing:
+            existing = agent._build_system_prompt(system_message)
+        return existing
+
+    def _fail_in_place_db_compaction(reason: str):
+        """Abort an in-place attempt without exposing an unpersisted rewrite."""
+        agent._last_compaction_db_error = str(reason or "state.db unavailable")
+        logger.warning(
+            "In-place compression aborted before durable commit for session=%s: %s",
+            agent.session_id or "?",
+            agent._last_compaction_db_error,
+        )
+        try:
+            agent._emit_warning(
+                "⚠ Compression could not be committed to state.db. "
+                "No messages were dropped; the conversation is unchanged. "
+                "Retry after the session database is available."
+            )
+        except Exception:
+            pass
+        return messages, _existing_system_prompt()
+
+    # In-place compaction is deliberately fail-closed. Without a durable DB
+    # handle there is nowhere to archive the active rows, so returning a
+    # compressed in-memory list would make the caller's JSON/transcript diverge
+    # from the canonical session store.
+    if in_place and _lock_db is None:
+        return _fail_in_place_db_compaction("session_db unavailable")
+
     try:
         if _lock_holder is not None:
             _lock_refresher = _CompressionLockLeaseRefresher(
@@ -1055,7 +1093,6 @@ def compress_context(
                     "without provider-supplied summary context",
                     engine_name,
                 )
-
         messages_before_compression = copy.deepcopy(messages)
         compressed = compress_fn(messages, **compress_kwargs)
     except BaseException:
@@ -1193,6 +1230,7 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
+        in_place_db_committed = False
         if agent._session_db:
             try:
                 # Trigger memory extraction on the current session before the
@@ -1220,7 +1258,15 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
+                    _commit_guard = getattr(agent, "_compression_before_db_commit", None)
+                    if callable(_commit_guard):
+                        # WebUI uses this narrow hook to re-check its sidecar
+                        # snapshot immediately before the durable archive. A
+                        # stale request must fail before state.db changes, not
+                        # after the DB/JSON stores have diverged.
+                        _commit_guard()
                     agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    in_place_db_committed = True
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
                     # are passed as conversation_history next turn and skipped by
@@ -1358,6 +1404,8 @@ def compress_context(
                 # old_session_id was cleared — so this is recovery, not an
                 # un-indexed orphan. Otherwise an earlier step failed before the
                 # child was created and the warning's original meaning holds.
+                if in_place and not in_place_db_committed:
+                    return _fail_in_place_db_compaction(e)
                 if locals().get("old_session_id") is None and not in_place:
                     logger.warning(
                         "Compression rotation aborted and rolled back to the "

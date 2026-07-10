@@ -59,6 +59,117 @@ def _seed(db, sid, title, n=8):
 
 
 class TestInPlaceCompaction:
+    def test_in_place_requires_db_and_returns_original_messages(self):
+        """An in-place attempt without state.db must be a durable no-op."""
+        from agent.conversation_compression import conversation_history_after_compression, compress_context
+
+        agent = _make_agent(None, "no-db", in_place=True)
+        calls = {"count": 0}
+
+        def _unexpected_compress(*args, **kwargs):
+            calls["count"] += 1
+            raise AssertionError("summary generation should not run without state.db")
+
+        agent.context_compressor.compress = _unexpected_compress
+        messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+
+        compressed, _ = compress_context(
+            agent, messages, approx_tokens=100_000, system_message="sys"
+        )
+
+        assert compressed == messages
+        assert calls["count"] == 0
+        assert agent._last_compaction_in_place is False
+        assert agent._last_compaction_db_error == "session_db unavailable"
+        assert conversation_history_after_compression(agent, compressed) is None
+
+    def test_in_place_summary_abort_does_not_archive(self):
+        """abort_on_summary_failure preserves both live rows and the signal."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "in_place_summary_abort"
+            _seed(db, sid, "abort")
+            agent = _make_agent(db, sid, in_place=True)
+            agent.context_compressor.abort_on_summary_failure = True
+
+            def _abort(messages, current_tokens=None, focus_topic=None, force=False):
+                agent.context_compressor._last_compress_aborted = True
+                agent.context_compressor._last_summary_error = "summary unavailable"
+                return messages
+
+            agent.context_compressor.compress = _abort
+            before = db.get_messages(sid)
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+
+            compressed, _ = compress_context(
+                agent, messages, approx_tokens=100_000, system_message="sys"
+            )
+
+            assert compressed == messages
+            assert db.get_messages(sid) == before
+            assert agent._last_compaction_in_place is False
+            assert agent._last_compaction_db_error is None
+
+    def test_in_place_db_failure_fails_closed(self):
+        """An archive failure must not expose the unpersisted compressed list."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "in_place_db_failure"
+            _seed(db, sid, "db-failure")
+            agent = _make_agent(db, sid, in_place=True)
+            before = db.get_messages(sid)
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+
+            with patch.object(
+                db,
+                "archive_and_compact",
+                side_effect=RuntimeError("database is locked"),
+            ) as archive:
+                compressed, _ = compress_context(
+                    agent, messages, approx_tokens=100_000, system_message="sys"
+                )
+
+            archive.assert_called_once()
+            assert compressed == messages
+            assert db.get_messages(sid) == before
+            assert agent._last_compaction_in_place is False
+            assert "database is locked" in agent._last_compaction_db_error
+
+    def test_in_place_commit_guard_runs_before_archive(self):
+        """A stale sidecar guard must prevent the DB archive itself."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "in_place_commit_guard"
+            _seed(db, sid, "guard")
+            agent = _make_agent(db, sid, in_place=True)
+            before = db.get_messages(sid)
+
+            def _stale_guard():
+                raise RuntimeError("session changed")
+
+            agent._compression_before_db_commit = _stale_guard
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+
+            with patch.object(db, "archive_and_compact", wraps=db.archive_and_compact) as archive:
+                compressed, _ = compress_context(
+                    agent, messages, approx_tokens=100_000, system_message="sys"
+                )
+
+            archive.assert_not_called()
+            assert compressed == messages
+            assert db.get_messages(sid) == before
+            assert agent._last_compaction_in_place is False
+            assert "session changed" in agent._last_compaction_db_error
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB
