@@ -2996,7 +2996,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         if is_first_nav and "features" in session_info:
             features = session_info["features"]
             active_features = [k for k, v in features.items() if v]
-            if not features.get("proxies"):
+            if not features.get("proxies") and not features.get("cdp_override"):
                 response["stealth_warning"] = (
                     "Running WITHOUT residential proxies. Bot detection may be more aggressive. "
                     "Consider upgrading Browserbase plan for proxy support."
@@ -3712,58 +3712,65 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     # spawning an ``agent-browser eval`` CLI process.  Falls through to the
     # subprocess path on any error so behaviour is unchanged when no
     # supervisor is running (e.g. plain agent-browser without a CDP backend).
-    try:
-        from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
-        supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
-        if supervisor is not None:
-            sup_result = supervisor.evaluate_runtime(expression)
-            if sup_result.get("ok"):
-                raw_result = sup_result.get("result")
-                # Match the agent-browser path: if the value is a JSON string,
-                # parse it so the model gets structured data.
-                parsed = raw_result
-                if isinstance(raw_result, str):
-                    try:
-                        parsed = json.loads(raw_result)
-                    except (json.JSONDecodeError, ValueError):
-                        pass  # keep as string
-                # Post-eval page-URL recheck: if this (or a prior) eval
-                # navigated the page to a private address, withhold the result.
-                if _eval_ssrf_guard_active(effective_task_id):
-                    _blocked_url = _current_page_private_url(effective_task_id)
-                    if _blocked_url:
-                        return json.dumps({
-                            "success": False,
-                            "error": (
-                                "Blocked: page URL targets a private or internal "
-                                f"address ({_blocked_url}). This may have been "
-                                "caused by a JavaScript navigation via "
-                                "browser_console."
-                            ),
-                        }, ensure_ascii=False)
-                response = {
-                    "success": True,
-                    "result": _redact_browser_output(parsed),
-                    "result_type": type(parsed).__name__,
-                    "method": "cdp_supervisor",
-                }
-                return json.dumps(response, ensure_ascii=False, default=str)
-            # JS exception is a real failure — surface it instead of falling
-            # through to the subprocess path (which would just re-run and
-            # produce the same exception, but slower).
-            err = sup_result.get("error") or "evaluate_runtime failed"
-            if "supervisor" not in err.lower():
-                # Real JS-side error — return it.
-                return json.dumps({"success": False, "error": err}, ensure_ascii=False)
-            # Supervisor-side failure (loop down, no session) — fall through.
-            logger.debug(
-                "browser_eval: supervisor path unavailable (%s), falling back to subprocess",
-                err,
-            )
-    except ImportError:
-        pass
-    except Exception as exc:  # pragma: no cover — defensive
-        logger.debug("browser_eval: supervisor path errored (%s), falling back", exc)
+    #
+    # NOTE: Skip the supervisor when CDP override is active (browser.cdp_url).
+    # The supervisor caches the page session ID from the initial attachment
+    # and never updates it when agent-browser navigates to a new tab —
+    # causing Runtime.evaluate to target the wrong page (e.g. chrome://newtab).
+    # The agent-browser fallback path handles tab targeting correctly.
+    if not _get_cdp_override():
+        try:
+            from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
+            supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
+            if supervisor is not None:
+                sup_result = supervisor.evaluate_runtime(expression)
+                if sup_result.get("ok"):
+                    raw_result = sup_result.get("result")
+                    # Match the agent-browser path: if the value is a JSON string,
+                    # parse it so the model gets structured data.
+                    parsed = raw_result
+                    if isinstance(raw_result, str):
+                        try:
+                            parsed = json.loads(raw_result)
+                        except (json.JSONDecodeError, ValueError):
+                            pass  # keep as string
+                    # Post-eval page-URL recheck: if this (or a prior) eval
+                    # navigated the page to a private address, withhold the result.
+                    if _eval_ssrf_guard_active(effective_task_id):
+                        _blocked_url = _current_page_private_url(effective_task_id)
+                        if _blocked_url:
+                            return json.dumps({
+                                "success": False,
+                                "error": (
+                                    "Blocked: page URL targets a private or internal "
+                                    f"address ({_blocked_url}). This may have been "
+                                    "caused by a JavaScript navigation via "
+                                    "browser_console."
+                                ),
+                            }, ensure_ascii=False)
+                    response = {
+                        "success": True,
+                        "result": _redact_browser_output(parsed),
+                        "result_type": type(parsed).__name__,
+                        "method": "cdp_supervisor",
+                    }
+                    return json.dumps(response, ensure_ascii=False, default=str)
+                # JS exception is a real failure — surface it instead of falling
+                # through to the subprocess path (which would just re-run and
+                # produce the same exception, but slower).
+                err = sup_result.get("error") or "evaluate_runtime failed"
+                if "supervisor" not in err.lower():
+                    # Real JS-side error — return it.
+                    return json.dumps({"success": False, "error": err}, ensure_ascii=False)
+                # Supervisor-side failure (loop down, no session) — fall through.
+                logger.debug(
+                    "browser_eval: supervisor path unavailable (%s), falling back to subprocess",
+                    err,
+                )
+        except ImportError:
+            pass
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("browser_eval: supervisor path errored (%s), falling back", exc)
 
     # --- Fallback: agent-browser CLI subprocess (original path) -------------
     result = _run_browser_command(effective_task_id, "eval", [expression])
