@@ -5248,6 +5248,63 @@ class SessionDB:
             "new_head_id": new_head_id,
         }
 
+    def reconcile_active_transcript_for_rewind(
+        self, session_id: str, messages: List[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        """Publish an exact active transcript while retaining the old rows.
+
+        This is the repair counterpart to :meth:`rewind_to_message`.  Normal
+        undo callers should prefer the targeted rewind because it preserves the
+        identity of every still-active prefix row.  A caller whose active view
+        has already diverged from its canonical transcript cannot identify one
+        trustworthy suffix boundary, however.  For that case this method
+        atomically:
+
+        * marks every currently-active row inactive as withdrawn history
+          (``active=0, compacted=0``),
+        * inserts ``messages`` as the exact new active view,
+        * updates the live message/tool counters, and
+        * increments ``rewind_count`` once.
+
+        Existing inactive rows are never deleted or reclassified, including
+        ``compacted=1`` archives.  The operation therefore repairs the live
+        transcript without destroying compaction or prior rewind audit history.
+        """
+
+        replacement = list(messages or [])
+
+        def _do(conn):
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError(f"session {session_id} not found")
+
+            row = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+            archived_count = int(row[0] if row else 0)
+            conn.execute(
+                "UPDATE messages SET active = 0, compacted = 0 "
+                "WHERE session_id = ? AND active = 1",
+                (session_id,),
+            )
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, replacement
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                "rewind_count = COALESCE(rewind_count, 0) + 1 WHERE id = ?",
+                (inserted, tool_calls_total, session_id),
+            )
+            return {
+                "rewound_count": archived_count,
+                "inserted_count": inserted,
+            }
+
+        return self._execute_write(_do)
+
     def restore_rewound(self, session_id: str, since_message_id: int) -> int:
         """Mark inactive messages with id >= *since_message_id* active again.
 

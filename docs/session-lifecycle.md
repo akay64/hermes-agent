@@ -202,6 +202,15 @@ The canonical transcript store is SQLite via `SessionDB` (from `hermes_state`). 
 (flags, timestamps, token counts). If SQLite is unavailable, the store falls back to
 JSONL, but this is a degradation path.
 
+`SessionDB.rewind_to_message()` is the normal targeted undo primitive: it keeps
+the surviving prefix rows active and soft-deletes the target user row and its
+suffix for audit. `SessionDB.reconcile_active_transcript_for_rewind()` is the
+repair counterpart for callers whose live projection is already divergent and
+has no trustworthy suffix boundary. It atomically retires the current active
+rows as non-compacted rewind history, inserts the requested active transcript,
+updates live counters, and increments `rewind_count`, without deleting or
+reclassifying any existing inactive compaction/rewind rows.
+
 ---
 
 ## 4. SessionKey Generation Rules

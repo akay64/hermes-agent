@@ -1181,6 +1181,61 @@ class TestMessageStorage:
         assert msgs[0]["content"] == content
         assert msgs[1]["content"] == "I see a screenshot."
 
+    def test_reconcile_active_transcript_for_rewind_preserves_archives(self, db):
+        db.create_session(session_id="s1", source="webui")
+        db.append_message("s1", role="user", content="archived question")
+        db.append_message("s1", role="assistant", content="archived answer")
+        db.archive_and_compact(
+            "s1",
+            [
+                {"role": "user", "content": "summary"},
+                {"role": "assistant", "content": "live answer"},
+                {"role": "user", "content": "ghost question"},
+            ],
+        )
+
+        result = db.reconcile_active_transcript_for_rewind(
+            "s1",
+            [
+                {"role": "user", "content": "summary"},
+                {"role": "assistant", "content": "live answer"},
+            ],
+        )
+
+        assert result == {"rewound_count": 3, "inserted_count": 2}
+        assert [m["content"] for m in db.get_messages("s1")] == [
+            "summary",
+            "live answer",
+        ]
+        all_rows = db.get_messages("s1", include_inactive=True)
+        assert sum(1 for m in all_rows if m["active"] == 0 and m["compacted"] == 1) == 2
+        assert sum(1 for m in all_rows if m["active"] == 0 and m["compacted"] == 0) == 3
+        session = db.get_session("s1")
+        assert session["rewind_count"] == 1
+        assert session["message_count"] == 2
+
+    def test_reconcile_active_transcript_for_rewind_is_atomic(self, db, monkeypatch):
+        db.create_session(session_id="s1", source="webui")
+        db.append_message("s1", role="user", content="keep me")
+        original_insert = db._insert_message_rows
+
+        def fail_insert(conn, session_id, messages):
+            raise RuntimeError("simulated insert failure")
+
+        monkeypatch.setattr(db, "_insert_message_rows", fail_insert)
+        with pytest.raises(RuntimeError, match="simulated insert failure"):
+            db.reconcile_active_transcript_for_rewind(
+                "s1", [{"role": "user", "content": "replacement"}]
+            )
+        monkeypatch.setattr(db, "_insert_message_rows", original_insert)
+
+        assert [m["content"] for m in db.get_messages("s1")] == ["keep me"]
+        assert db.get_session("s1")["rewind_count"] == 0
+
+    def test_reconcile_active_transcript_for_rewind_requires_session(self, db):
+        with pytest.raises(ValueError, match="session missing not found"):
+            db.reconcile_active_transcript_for_rewind("missing", [])
+
     def test_get_messages_as_conversation(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")
