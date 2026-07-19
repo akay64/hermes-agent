@@ -2325,6 +2325,8 @@ Write only the summary body. Do not include any preamble or prefix."""
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
+‼️ GATE — STOP - ACKNOWLEDGE FIRST: The previous summary will be DISCARDED after this compaction. Any information you reference but do not reproduce will be PERMANENTLY LOST. You MUST reproduce every numbered item from the PREVIOUS SUMMARY's \"Completed Actions\" section in full — do NOT write \"[items 1–19 retained]\", \"[previous entries retained]\", or any footnote or reference in place of actual items. Continue the numbering and add new items below. Similarly, reproduce existing entries from \"Resolved Questions\", \"Relevant Files\", \"Key Decisions\", and other sections before adding new ones. CONSOLIDATE where appropriate — if the old summary has grown unwieldy, combine and condense repeated or obsolete points — but never replace concrete facts with a bare reference.
+
 PREVIOUS SUMMARY:
 {self._previous_summary}
 
