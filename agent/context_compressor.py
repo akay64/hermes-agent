@@ -3211,7 +3211,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             min(min_tail_floor, compressible_tail_cap, available_tail)
             if available_tail > 1 else 0
         )
-        soft_ceiling = int(token_budget * 1.5)
+        soft_ceiling = max(8_000, int(token_budget * 1.5))
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
