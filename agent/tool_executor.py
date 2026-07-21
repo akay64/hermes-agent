@@ -483,6 +483,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                     middleware_trace=list(middleware_trace),
+                    plan_mode=getattr(agent, "plan_mode", False),
                 )
             except Exception:
                 block_message = None
@@ -1148,6 +1149,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                     middleware_trace=list(middleware_trace),
+                    plan_mode=getattr(agent, "plan_mode", False),
                 )
             except Exception:
                 pass

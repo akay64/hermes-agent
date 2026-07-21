@@ -2107,6 +2107,7 @@ def _get_pre_tool_call_directive_details(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    plan_mode: bool = False,
 ) -> _PreToolCallDirective:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
 
@@ -2152,6 +2153,7 @@ def _get_pre_tool_call_directive_details(
         turn_id=turn_id,
         api_request_id=api_request_id,
         middleware_trace=list(middleware_trace or []),
+        plan_mode=bool(plan_mode),
     )
 
     for result in hook_results:
@@ -2234,6 +2236,7 @@ def resolve_pre_tool_block(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    plan_mode: bool = False,
 ) -> Optional[str]:
     """Resolve the pre_tool_call directive to a final block message (or None).
 
@@ -2253,6 +2256,7 @@ def resolve_pre_tool_block(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
+        plan_mode=plan_mode,
     )
     if details.action == "block":
         return details.message

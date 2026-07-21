@@ -1748,6 +1748,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        plan_mode: bool = False,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -1874,6 +1875,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
+            plan_mode=plan_mode,
             gateway_session_key=gateway_session_key,
         )
         return agent
@@ -2670,6 +2672,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        if "plan_mode" in body and not isinstance(body["plan_mode"], bool):
+            return web.json_response(
+                _openai_error("'plan_mode' must be a boolean"),
+                status=400,
+            )
+        plan_mode = body.get("plan_mode", False)
+
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -2861,6 +2870,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                plan_mode=plan_mode,
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
@@ -2885,6 +2895,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                plan_mode=plan_mode,
                 gateway_session_key=gateway_session_key,
                 route=route,
             )
@@ -4627,6 +4638,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        plan_mode: bool = False,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -4669,6 +4681,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
+                        plan_mode=plan_mode,
                         stream_delta_callback=stream_delta_callback,
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
@@ -4797,6 +4810,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
+        if "plan_mode" in body and not isinstance(body["plan_mode"], bool):
+            return web.json_response(
+                _openai_error("'plan_mode' must be a boolean"),
+                status=400,
+            )
+        plan_mode = body.get("plan_mode", False)
+
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
@@ -4920,6 +4940,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
+                        plan_mode=plan_mode,
                         stream_delta_callback=_text_cb,
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
