@@ -2250,6 +2250,101 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             "do not preserve their values."
         )
 
+        # The two sources support fundamentally different summarization jobs.
+        # Keep each policy self-contained rather than forcing weak bounded-source
+        # models to follow semantic instructions that require missing evidence.
+        if self._previous_summary:
+            _bounded_source_policy = """
+SOURCE QUALITY: BOUNDED / PARTIALLY PRUNED — CONSERVATIVE UPDATE
+Some tool arguments and results are compact receipts rather than their full text.
+The PREVIOUS SUMMARY is therefore the semantic source of truth for earlier work.
+
+‼️ GATE — STOP - ACKNOWLEDGE FIRST: The previous summary will be DISCARDED after
+this compaction. Reproduce every still-relevant concrete fact, decision,
+constraint, result, blocker, unresolved issue, and continuation-critical value
+from it in the new summary. Never replace those facts with "previous entries
+retained", "items unchanged", or another reference. You may merge exact
+duplicates, but do not reinterpret or compress away prior facts using incomplete
+receipts.
+
+Apply new information conservatively. Add or supersede a fact only when it is
+explicitly stated in retained user/assistant text or unambiguously established by
+complete visible evidence. A tool receipt proves that an action occurred; it does
+not prove what was learned. Do not infer findings, causal relationships, lessons,
+or success from file names, match counts, character counts, exit codes, or tool
+metadata. If consequential new activity is the only surviving evidence, preserve
+one concise entry and label its outcome as unavailable in the retained source.
+Do not list every receipt. Preserve uncertainty instead of guessing.
+
+Hermes preserves the structured todo list separately. Do not recreate its ordered
+checklist or completion statuses; retain only context needed to understand or
+safely continue the work.
+"""
+            _full_fidelity_policy = """
+SOURCE QUALITY: FULL FIDELITY — SEMANTIC REWRITE
+The source contains complete textual conversation content, tool arguments, and
+tool results. Use the evidence to reconstruct what happened and compress it around
+meaning rather than execution chronology.
+
+‼️ GATE — STOP - ACKNOWLEDGE FIRST: The previous summary will be DISCARDED after
+this compaction. Preserve every still-relevant concrete fact, decision,
+constraint, result, blocker, unresolved issue, and continuation-critical value,
+but preserve the information rather than its old wording, numbering, or order.
+Never replace facts with "previous entries retained" or "items unchanged".
+
+Rewrite, merge, reorder, and deduplicate freely. Collapse repeated attempts, tool
+calls, and intermediate states into their causal story: the problem encountered,
+materially different approaches, failure modes or constraints worth remembering,
+lessons that prevent repetition, and the final approach or current result. Keep a
+failed attempt only when its lesson affects future work. Replace stale operational
+state with newer state when the source supports it. Mention exact commands or raw
+outputs only when needed to reproduce a result, understand an unresolved failure,
+or continue safely. Do not produce a chronological tool or activity ledger.
+
+Hermes preserves the structured todo list separately. Do not recreate its ordered
+checklist or completion statuses; retain only context needed to understand or
+safely continue the work.
+"""
+        else:
+            _bounded_source_policy = """
+SOURCE QUALITY: BOUNDED / PARTIALLY PRUNED — FIRST CHECKPOINT
+Some tool arguments and results are compact receipts rather than their full text,
+and no previous semantic summary exists. Preserve facts, decisions, outcomes,
+constraints, failures, and unresolved issues explicitly stated in retained
+user/assistant text or unambiguously established by complete visible evidence.
+
+A tool receipt proves that an action occurred; it does not prove what was learned.
+Do not infer findings, causal relationships, lessons, or success from file names,
+match counts, character counts, exit codes, or tool metadata. When consequential
+activity is the only surviving evidence, preserve one concise entry and state that
+its outcome is unavailable in the retained source. Do not list every receipt or
+pretend missing semantics are known. Preserve uncertainty instead of guessing.
+
+Hermes preserves the structured todo list separately. Do not recreate its ordered
+checklist or completion statuses; retain only context needed to understand or
+safely continue the work.
+"""
+            _full_fidelity_policy = """
+SOURCE QUALITY: FULL FIDELITY — FIRST CHECKPOINT
+The source contains complete textual conversation content, tool arguments, and
+tool results. Use the evidence to reconstruct what happened and compress it around
+meaning rather than execution chronology.
+
+Collapse repeated attempts, tool calls, and intermediate states into their causal
+story: the problem encountered, materially different approaches, failure modes or
+constraints worth remembering, lessons that prevent repetition, and the final
+approach or current result. Keep a failed attempt only when its lesson affects
+future work. Preserve confirmed decisions and rationale, consequential changes,
+validation results, unresolved failures, and current state. Mention exact commands
+or raw outputs only when needed to reproduce a result, understand an unresolved
+failure, or continue safely. Do not produce a chronological tool or activity
+ledger.
+
+Hermes preserves the structured todo list separately. Do not recreate its ordered
+checklist or completion statuses; retain only context needed to understand or
+safely continue the work.
+"""
+
         # Temporal anchoring directive. Rewrites relative / still-pending-sounding
         # references into absolute, dated, past-tense facts so a resumed
         # conversation does not re-issue completed actions. Only emitted when the
@@ -2300,13 +2395,10 @@ If no outstanding task exists, write "None."]
 [User preferences, coding style, constraints, important decisions]
 
 ## Completed Actions
-[Numbered list of concrete actions taken — include tool used, target, and outcome.
-Format each as: N. ACTION target — outcome [tool: name]
-Example:
-1. READ config.py:45 — found `==` should be `!=` [tool: read_file]
-2. PATCH config.py:45 — changed `==` to `!=` [tool: patch]
-3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
-Be specific with file paths, commands, line numbers, and results.]
+[Follow the active SOURCE QUALITY policy. Record completed outcomes supported by
+the available evidence. In bounded mode, if consequential activity is the only
+surviving evidence, state briefly that it occurred and that its outcome is
+unavailable rather than inventing one. Do not add `[tool: ...]` annotations.]
 
 ## Active State
 [Current working state — include:
@@ -2332,7 +2424,9 @@ Be specific with file paths, commands, line numbers, and results.]
 [Questions or requests from the user that have NOT yet been answered or fulfilled. These are STALE — they were from the compacted turns. Write them here for reference only. The agent must NOT act on them unless the latest user message explicitly requests it. If none, write "None."]
 
 ## Relevant Files
-[Files read, modified, or created — with brief note on each]
+[Files modified, created, or directly required to continue the task, with a
+brief note on each. Include a read-only file only when it contains a key contract
+or finding. Do not inventory every file inspected.]
 
 {HISTORICAL_REMAINING_WORK_HEADING}
 [What remains to be done — framed as STALE context for reference only. The agent must NOT resume this work unless the latest user message explicitly asks for it.]
@@ -2340,7 +2434,11 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
-Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{summary_budget} tokens. Be concrete about outcomes. Preserve exact file
+paths, commands, outputs, error messages, line numbers, and values only when they
+are needed to reproduce a result, understand an unresolved failure, or continue
+safely. Otherwise preserve the conclusion rather than the raw evidence. Avoid
+vague descriptions like "made some changes" — say what changed and why it matters.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
@@ -2349,8 +2447,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             prompt = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
-
-‼️ GATE — STOP - ACKNOWLEDGE FIRST: The previous summary will be DISCARDED after this compaction. Any information you reference but do not reproduce will be PERMANENTLY LOST. You MUST reproduce every numbered item from the PREVIOUS SUMMARY's \"Completed Actions\" section in full — do NOT write \"[items 1–19 retained]\", \"[previous entries retained]\", or any footnote or reference in place of actual items. Continue the numbering and add new items below. Similarly, reproduce existing entries from \"Resolved Questions\", \"Relevant Files\", \"Key Decisions\", and other sections before adding new ones. CONSOLIDATE where appropriate — if the old summary has grown unwieldy, combine and condense repeated or obsolete points — but never replace concrete facts with a bare reference.
+{_bounded_source_policy}
 
 PREVIOUS SUMMARY:
 {self._previous_summary}
@@ -2358,7 +2455,14 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+Update the summary using this exact structure and follow the active SOURCE QUALITY
+policy for preservation, synthesis, uncertainty, and superseding older state.
+Move answered questions to "Resolved Questions" only when the available evidence
+supports that they were answered.
+CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent
+unfulfilled input — this includes any question, decision request, or discussion
+turn that the assistant has not yet answered. Only write "None" if the last
+exchange was fully resolved.
 
 {_template_sections}"""
         else:
@@ -2366,6 +2470,8 @@ Update the summary using this exact structure. PRESERVE all existing information
             prompt = f"""{_summarizer_preamble}
 
 Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
+
+{_bounded_source_policy}
 
 TURNS TO SUMMARIZE:
 {content_to_summarize}{_memory_section}
@@ -2380,7 +2486,7 @@ Use this exact structure:
             prompt += f"""
 
 FOCUS TOPIC: "{focus_topic}"
-This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving information related to the focus topic above. For content related to "{focus_topic}", preserve supported findings, decisions, constraints, failures, and continuation-critical values or paths. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Never infer details that the active source cannot support. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
         # Keep the stock prompt above as the exact fallback for unknown or
         # insufficient auxiliary capacity. When capacity is known, substitute
@@ -2402,6 +2508,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                     full_fidelity_turns
                 )
                 full_prompt = prompt.replace(stock_source, full_source, 1)
+                full_prompt = full_prompt.replace(
+                    _bounded_source_policy,
+                    _full_fidelity_policy,
+                    1,
+                )
                 full_prompt = full_prompt.replace(
                     f"Target ~{summary_budget} tokens.",
                     f"Target ~{full_summary_budget} tokens.",
@@ -2622,6 +2733,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    full_fidelity_turns=full_fidelity_turns,
                 )  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
@@ -2643,6 +2755,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    full_fidelity_turns=full_fidelity_turns,
                 )
 
             # Transient errors (timeout, rate limit, network, JSON decode,

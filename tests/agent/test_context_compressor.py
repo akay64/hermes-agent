@@ -102,6 +102,13 @@ class TestFullFidelitySummarySource:
         assert self.ARG_SENTINEL in prompt
         assert "[read_file] read large.txt" not in prompt
         assert self.REASONING_SENTINEL not in prompt
+        assert "SOURCE QUALITY: FULL FIDELITY — FIRST CHECKPOINT" in prompt
+        assert "SOURCE QUALITY: BOUNDED / PARTIALLY PRUNED" not in prompt
+        assert "compress it around\nmeaning rather than execution chronology" in prompt
+        assert "materially different approaches, failure modes" in prompt
+        assert "lessons that prevent repetition" in prompt
+        assert "Do not produce a chronological tool or activity\nledger" in prompt
+        assert "Do not add `[tool: ...]` annotations" in prompt
         full_summary_budget = compressor._compute_summary_budget(source)
         assert f"Target ~{full_summary_budget} tokens." in prompt
 
@@ -129,6 +136,113 @@ class TestFullFidelitySummarySource:
         assert "[read_file] read large.txt" in prompt
         assert self.TOOL_SENTINEL not in prompt
         assert self.ARG_SENTINEL not in prompt
+        assert "SOURCE QUALITY: BOUNDED / PARTIALLY PRUNED — FIRST CHECKPOINT" in prompt
+        assert "SOURCE QUALITY: FULL FIDELITY" not in prompt
+        assert "A tool receipt proves that an action occurred" in prompt
+        assert "outcome is unavailable in the retained source" in prompt
+        assert "Do not list every receipt" in prompt
+        assert "Preserve uncertainty instead of guessing" in prompt
+        assert "materially different approaches" not in prompt
+        assert "lessons that prevent repetition" not in prompt
+
+    def test_full_fidelity_iterative_policy_rewrites_without_fact_loss(
+        self,
+        compressor,
+    ):
+        source, pruned = self._source_and_pruned_turns(compressor)
+        compressor._previous_summary = """## Goal
+Fix the compressor.
+
+## Completed Actions
+1. READ old.py — found the old behavior [tool: read_file]
+"""
+        compressor.set_summary_context_length(1_000_000)
+        captured = {}
+
+        def fake_call_llm(**kwargs):
+            captured["prompt"] = kwargs["messages"][0]["content"]
+            return self._summary_response()
+
+        with patch("agent.context_compressor.call_llm", side_effect=fake_call_llm):
+            compressor._generate_summary(
+                pruned,
+                full_fidelity_turns=source,
+            )
+
+        prompt = captured["prompt"]
+        assert "SOURCE QUALITY: FULL FIDELITY — SEMANTIC REWRITE" in prompt
+        assert "‼️ GATE — STOP - ACKNOWLEDGE FIRST" in prompt
+        assert "preserve the information rather than its old" in prompt
+        assert "Rewrite, merge, reorder, and deduplicate freely" in prompt
+        assert "Collapse repeated attempts, tool" in prompt
+        assert "MUST reproduce every numbered item" not in prompt
+        assert "ADD new completed actions to the numbered list" not in prompt
+        assert 'Update "## Active Task"' not in prompt
+
+    def test_bounded_iterative_policy_preserves_prior_facts_without_inference(
+        self,
+        compressor,
+    ):
+        source, pruned = self._source_and_pruned_turns(compressor)
+        compressor._previous_summary = """## Goal
+Fix the compressor.
+
+## Completed Actions
+1. Confirmed the old behavior.
+"""
+        compressor.set_summary_context_length(1_000)
+        captured = {}
+
+        def fake_call_llm(**kwargs):
+            captured["prompt"] = kwargs["messages"][0]["content"]
+            return self._summary_response()
+
+        with patch("agent.context_compressor.call_llm", side_effect=fake_call_llm):
+            compressor._generate_summary(
+                pruned,
+                full_fidelity_turns=source,
+            )
+
+        prompt = captured["prompt"]
+        assert "SOURCE QUALITY: BOUNDED / PARTIALLY PRUNED — CONSERVATIVE UPDATE" in prompt
+        assert "SOURCE QUALITY: FULL FIDELITY" not in prompt
+        assert "‼️ GATE — STOP - ACKNOWLEDGE FIRST" in prompt
+        assert "Reproduce every still-relevant concrete fact" in prompt
+        assert "do not reinterpret or compress away prior facts" in prompt
+        assert "label its outcome as unavailable in the retained source" in prompt
+        assert "Rewrite, merge, reorder, and deduplicate freely" not in prompt
+        assert "lessons that prevent repetition" not in prompt
+
+    def test_main_model_retry_keeps_full_fidelity_source_and_policy(
+        self,
+        compressor,
+    ):
+        source, pruned = self._source_and_pruned_turns(compressor)
+        compressor.set_summary_context_length(1_000_000)
+        compressor.summary_model = "broken-aux-model"
+        err = StubProviderError(
+            "404 model_not_found: no such model",
+            status_code=404,
+        )
+        prompts = []
+
+        def fake_call_llm(**kwargs):
+            prompts.append(kwargs["messages"][0]["content"])
+            if len(prompts) == 1:
+                raise err
+            return self._summary_response()
+
+        with patch("agent.context_compressor.call_llm", side_effect=fake_call_llm):
+            compressor._generate_summary(
+                pruned,
+                full_fidelity_turns=source,
+            )
+
+        assert len(prompts) == 2
+        for prompt in prompts:
+            assert self.TOOL_SENTINEL in prompt
+            assert "SOURCE QUALITY: FULL FIDELITY" in prompt
+            assert "SOURCE QUALITY: BOUNDED / PARTIALLY PRUNED" not in prompt
 
     def test_compress_passes_same_original_middle_indexes(self):
         with patch(
