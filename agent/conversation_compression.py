@@ -337,6 +337,17 @@ def check_compression_model_feasibility(agent: Any) -> None:
             get_model_context_length,
         )
 
+        # Capacity belongs to the built-in compressor, not the generic context-
+        # engine interface. Clear a previous probe result defensively, but keep
+        # third-party engines compatible by treating the setter as optional.
+        _set_summary_context_length = getattr(
+            agent.context_compressor,
+            "set_summary_context_length",
+            None,
+        )
+        if callable(_set_summary_context_length):
+            _set_summary_context_length(None)
+
         # Best-effort aux provider label for the warning message. The
         # configured provider may be "auto", in which case we fall back
         # to the client's base_url hostname so the user can still tell
@@ -421,6 +432,12 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 f"auxiliary.compression.context_length to override the "
                 f"detected value if it is wrong."
             )
+
+        # Reuse the already-resolved capacity inside ContextCompressor rather
+        # than duplicating provider/model resolution during each compaction.
+        # Unknown capacity keeps the historical bounded summary source.
+        if callable(_set_summary_context_length):
+            _set_summary_context_length(aux_context)
 
         threshold = agent.context_compressor.threshold_tokens
         if aux_context < threshold:

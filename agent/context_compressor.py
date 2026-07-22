@@ -273,6 +273,10 @@ _SUMMARY_RATIO = 0.20
 # Summaries must stay within a 1K-16K token envelope — anything larger is
 # itself a context-pressure source and slows every compaction.
 _SUMMARY_TOKENS_CEILING = 16_000
+# Rough token estimates vary by model/tokenizer. Reserve 10% of the auxiliary
+# context so the full-fidelity path does not turn an estimate near the limit
+# into a provider-side context error.
+_SUMMARY_INPUT_SAFETY_RATIO = 0.90
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -1398,6 +1402,9 @@ class ContextCompressor(ContextEngine):
         self.awaiting_real_usage_after_compression = False
 
         self.summary_model = summary_model_override or ""
+        # Resolved by check_compression_model_feasibility(). None keeps the
+        # historical pruned/truncated summary source until capacity is known.
+        self.summary_context_length: Optional[int] = None
         self._session_db: Any = None
         self._session_id: str = ""
 
@@ -1455,6 +1462,17 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+
+    def set_summary_context_length(self, context_length: int | None) -> None:
+        """Record the resolved auxiliary compression-model context window."""
+        if (
+            isinstance(context_length, int)
+            and not isinstance(context_length, bool)
+            and context_length > 0
+        ):
+            self.summary_context_length = context_length
+        else:
+            self.summary_context_length = None
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -1832,12 +1850,18 @@ class ContextCompressor(ContextEngine):
     _TOOL_ARGS_MAX = 1500     # tool call argument chars
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
 
-    def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
+    def _serialize_for_summary(
+        self,
+        turns: List[Dict[str, Any]],
+        *,
+        full_fidelity: bool = False,
+    ) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
 
-        Includes tool call arguments and result content (up to
-        ``_CONTENT_MAX`` chars per message) so the summarizer can preserve
-        specific details like file paths, commands, and outputs.
+        The historical path bounds message bodies and tool-call arguments. The
+        full-fidelity path preserves complete textual content when the resolved
+        auxiliary model has room for the complete prompt. Both paths retain the
+        same redaction, media normalization, and reasoning-exclusion policy.
 
         All content is redacted before serialization to prevent secrets
         (API keys, tokens, passwords) from leaking into the summary that
@@ -1884,14 +1908,14 @@ class ContextCompressor(ContextEngine):
             # Tool results: keep enough content for the summarizer
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
-                if len(content) > self._CONTENT_MAX:
+                if not full_fidelity and len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
 
             # Assistant messages: include tool call names AND arguments
             if role == "assistant":
-                if len(content) > self._CONTENT_MAX:
+                if not full_fidelity and len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
                 tool_calls = msg.get("tool_calls", [])
                 if tool_calls:
@@ -1902,7 +1926,7 @@ class ContextCompressor(ContextEngine):
                             name = fn.get("name", "?")
                             args = redact_sensitive_text(fn.get("arguments", ""))
                             # Truncate long arguments but keep enough for context
-                            if len(args) > self._TOOL_ARGS_MAX:
+                            if not full_fidelity and len(args) > self._TOOL_ARGS_MAX:
                                 args = args[:self._TOOL_ARGS_HEAD] + "..."
                             tc_parts.append(f"  {name}({args})")
                         else:
@@ -1914,7 +1938,7 @@ class ContextCompressor(ContextEngine):
                 continue
 
             # User and other roles
-            if len(content) > self._CONTENT_MAX:
+            if not full_fidelity and len(content) > self._CONTENT_MAX:
                 content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
             parts.append(f"[{role.upper()}]: {content}")
 
@@ -2146,6 +2170,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         memory_context: str = "",
+        full_fidelity_turns: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -2356,6 +2381,61 @@ Use this exact structure:
 
 FOCUS TOPIC: "{focus_topic}"
 This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+
+        # Keep the stock prompt above as the exact fallback for unknown or
+        # insufficient auxiliary capacity. When capacity is known, substitute
+        # the original unpruned middle and select it only when the complete
+        # request plus expected summary output fits safely.
+        if full_fidelity_turns is not None and self.summary_context_length:
+            full_content = self._serialize_for_summary(
+                full_fidelity_turns,
+                full_fidelity=True,
+            )
+            if self._previous_summary:
+                stock_source = f"NEW TURNS TO INCORPORATE:\n{content_to_summarize}"
+                full_source = f"NEW TURNS TO INCORPORATE:\n{full_content}"
+            else:
+                stock_source = f"TURNS TO SUMMARIZE:\n{content_to_summarize}"
+                full_source = f"TURNS TO SUMMARIZE:\n{full_content}"
+            if stock_source in prompt:
+                full_summary_budget = self._compute_summary_budget(
+                    full_fidelity_turns
+                )
+                full_prompt = prompt.replace(stock_source, full_source, 1)
+                full_prompt = full_prompt.replace(
+                    f"Target ~{summary_budget} tokens.",
+                    f"Target ~{full_summary_budget} tokens.",
+                    1,
+                )
+                estimated_prompt_tokens = estimate_messages_tokens_rough([
+                    {"role": "user", "content": full_prompt},
+                ])
+                estimated_total_tokens = (
+                    estimated_prompt_tokens + full_summary_budget
+                )
+                safe_context_tokens = int(
+                    self.summary_context_length * _SUMMARY_INPUT_SAFETY_RATIO
+                )
+                if estimated_total_tokens <= safe_context_tokens:
+                    prompt = full_prompt
+                    logger.info(
+                        "Context compression summary source: full fidelity "
+                        "(%d estimated prompt + output tokens <= %d safe auxiliary tokens)",
+                        estimated_total_tokens,
+                        safe_context_tokens,
+                    )
+                else:
+                    logger.info(
+                        "Context compression summary source: stock bounded "
+                        "(%d estimated prompt + output tokens > %d safe auxiliary tokens)",
+                        estimated_total_tokens,
+                        safe_context_tokens,
+                    )
+            else:
+                logger.warning(
+                    "Context compression full-fidelity source marker was not "
+                    "found; using stock bounded summary source"
+                )
 
         try:
             call_kwargs = {
@@ -3391,6 +3471,11 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
+        # Preserve the canonical source before producing the lossy replay
+        # projection. Pruning replaces contents but does not add/remove message
+        # records, so boundaries remain valid for both lists.
+        source_messages = messages
+
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
@@ -3425,6 +3510,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             return messages
 
         turns_to_summarize = messages[compress_start:compress_end]
+        full_fidelity_turns = source_messages[compress_start:compress_end]
         # A persisted handoff summary can sit in the protected head after a
         # resume (commonly immediately after the system prompt). Search from
         # the first non-system message through the compression window so we can
@@ -3441,7 +3527,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         if summary_idx is not None:
             if summary_body and not self._previous_summary:
                 self._previous_summary = summary_body
-            turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
+            summary_start = max(compress_start, summary_idx + 1)
+            turns_to_summarize = messages[summary_start:compress_end]
+            full_fidelity_turns = source_messages[summary_start:compress_end]
         elif self._previous_summary:
             # No handoff summary found in the current messages, but
             # _previous_summary is non-empty — it was set by a different
@@ -3478,6 +3566,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             turns_to_summarize,
             focus_topic=summary_focus_topic,
             memory_context=memory_context,
+            full_fidelity_turns=full_fidelity_turns,
         )
 
         # If summary generation failed, behavior splits on

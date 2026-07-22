@@ -8,7 +8,7 @@ Two-phase design:
      status_callback (gateway platforms)
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -96,6 +96,10 @@ def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_clien
     assert agent._compression_warning is not None
     # Threshold on the live compressor was actually lowered to aux_context.
     assert agent.context_compressor.threshold_tokens == 80_000
+    assert agent.context_compressor.set_summary_context_length.call_args_list == [
+        call(None),
+        call(80_000),
+    ]
 
 
 @patch("agent.model_metadata.get_model_context_length", return_value=32_768)
@@ -139,6 +143,10 @@ def test_no_warning_when_aux_context_sufficient(mock_get_client, mock_ctx_len):
 
     assert len(messages) == 0
     assert agent._compression_warning is None
+    assert agent.context_compressor.set_summary_context_length.call_args_list == [
+        call(None),
+        call(200_000),
+    ]
 
 
 def test_feasibility_check_passes_live_main_runtime():
@@ -237,6 +245,10 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
             self.context_length = 200_000
             self.threshold_tokens = 100_000
             self.threshold_percent = 0.50
+            self.summary_context_length = None
+
+        def set_summary_context_length(self, context_length):
+            self.summary_context_length = context_length
 
         def get_tool_schemas(self):
             return []
@@ -280,6 +292,7 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
         # The expensive feasibility probe is deferred. Drive it manually
         # to validate the call shape still forwards the override correctly.
         agent._check_compression_model_feasibility()
+        assert agent.context_compressor.summary_context_length == 1_000_000
 
     mock_ctx_len.assert_called_once_with(
         "custom/big-model",
@@ -305,6 +318,7 @@ def test_warns_when_no_auxiliary_provider(mock_get_client):
     assert len(messages) == 1
     assert "No auxiliary LLM provider" in messages[0]
     assert agent._compression_warning is not None
+    agent.context_compressor.set_summary_context_length.assert_called_once_with(None)
 
 
 def test_no_unavailable_warning_when_configured_fallback_chain_resolves():

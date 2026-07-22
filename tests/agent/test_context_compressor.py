@@ -37,6 +37,158 @@ def compressor():
         return c
 
 
+class TestFullFidelitySummarySource:
+    TOOL_SENTINEL = "FULL_TOOL_RESULT_SENTINEL_7f93"
+    ARG_SENTINEL = "FULL_TOOL_ARGUMENT_SENTINEL_4c21"
+    REASONING_SENTINEL = "NATIVE_REASONING_MUST_STAY_EXCLUDED_2a18"
+
+    @classmethod
+    def _source_and_pruned_turns(cls, compressor):
+        arguments = json.dumps({
+            "path": "large.txt",
+            "content": ("a" * 1800) + cls.ARG_SENTINEL + ("b" * 1800),
+        })
+        source = [
+            {
+                "role": "assistant",
+                "content": "reading the source",
+                "reasoning": cls.REASONING_SENTINEL,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": arguments,
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": ("x" * 7000) + cls.TOOL_SENTINEL + ("y" * 7000),
+            },
+            {"role": "assistant", "content": "analysis complete"},
+        ]
+        pruned, count = compressor._prune_old_tool_results(
+            source,
+            protect_tail_count=0,
+        )
+        assert count >= 1
+        return source, pruned
+
+    @staticmethod
+    def _summary_response():
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "## Goal\nPreserve context"
+        return response
+
+    def test_fitting_capacity_sends_original_tool_evidence(self, compressor):
+        source, pruned = self._source_and_pruned_turns(compressor)
+        compressor.set_summary_context_length(1_000_000)
+        captured = {}
+
+        def fake_call_llm(**kwargs):
+            captured["prompt"] = kwargs["messages"][0]["content"]
+            return self._summary_response()
+
+        with patch("agent.context_compressor.call_llm", side_effect=fake_call_llm):
+            compressor._generate_summary(
+                pruned,
+                full_fidelity_turns=source,
+            )
+
+        prompt = captured["prompt"]
+        assert self.TOOL_SENTINEL in prompt
+        assert self.ARG_SENTINEL in prompt
+        assert "[read_file] read large.txt" not in prompt
+        assert self.REASONING_SENTINEL not in prompt
+        full_summary_budget = compressor._compute_summary_budget(source)
+        assert f"Target ~{full_summary_budget} tokens." in prompt
+
+    @pytest.mark.parametrize("summary_context_length", [None, 1_000])
+    def test_unknown_or_insufficient_capacity_keeps_stock_source(
+        self,
+        compressor,
+        summary_context_length,
+    ):
+        source, pruned = self._source_and_pruned_turns(compressor)
+        compressor.set_summary_context_length(summary_context_length)
+        captured = {}
+
+        def fake_call_llm(**kwargs):
+            captured["prompt"] = kwargs["messages"][0]["content"]
+            return self._summary_response()
+
+        with patch("agent.context_compressor.call_llm", side_effect=fake_call_llm):
+            compressor._generate_summary(
+                pruned,
+                full_fidelity_turns=source,
+            )
+
+        prompt = captured["prompt"]
+        assert "[read_file] read large.txt" in prompt
+        assert self.TOOL_SENTINEL not in prompt
+        assert self.ARG_SENTINEL not in prompt
+
+    def test_compress_passes_same_original_middle_indexes(self):
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100_000,
+        ):
+            compressor = ContextCompressor(
+                model="test/model",
+                protect_first_n=1,
+                protect_last_n=1,
+                quiet_mode=True,
+            )
+        compressor.tail_token_budget = 100
+        compressor.set_summary_context_length(1_000_000)
+
+        tool_content = ("x" * 7000) + self.TOOL_SENTINEL + ("y" * 7000)
+        messages = [
+            {"role": "user", "content": "HEAD_SENTINEL"},
+            {
+                "role": "assistant",
+                "content": "reading",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "large.txt"}),
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": tool_content},
+            {"role": "assistant", "content": "z" * 1000},
+            {"role": "user", "content": "middle question"},
+            {"role": "assistant", "content": "middle answer"},
+            {"role": "user", "content": "TAIL_SENTINEL"},
+            {"role": "assistant", "content": "tail answer"},
+        ]
+        captured = {}
+
+        def fake_generate(turns, **kwargs):
+            captured["stock"] = turns
+            captured["full"] = kwargs["full_fidelity_turns"]
+            return "summary"
+
+        with (
+            patch.object(compressor, "_find_tail_cut_by_tokens", return_value=6),
+            patch.object(compressor, "_generate_summary", side_effect=fake_generate),
+        ):
+            compressor.compress(messages, current_tokens=90_000)
+
+        assert [turn["role"] for turn in captured["stock"]] == [
+            turn["role"] for turn in captured["full"]
+        ]
+        assert len(captured["stock"]) == len(captured["full"]) == 5
+        assert captured["stock"][1]["content"].startswith("[read_file]")
+        assert self.TOOL_SENTINEL in captured["full"][1]["content"]
+        full_text = "\n".join(str(turn.get("content", "")) for turn in captured["full"])
+        assert "HEAD_SENTINEL" not in full_text
+        assert "TAIL_SENTINEL" not in full_text
+
+
 class TestSummarizeToolResultWebExtract:
     """Pre-compression pruning must survive web_extract calls whose ``urls`` are
     web_search result dicts ({"url"/"href": ...}), which models routinely forward
