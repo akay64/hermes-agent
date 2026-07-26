@@ -115,6 +115,7 @@ def _connect(hermes_home=None) -> sqlite3.Connection:
             delivery_channel TEXT NOT NULL DEFAULT 'legacy_queue',
             delivery_namespace TEXT NOT NULL DEFAULT '',
             delivery_owner TEXT NOT NULL DEFAULT '',
+            delivery_store TEXT NOT NULL DEFAULT '',
             discarded_reason TEXT
         )"""
     )
@@ -128,6 +129,7 @@ def _connect(hermes_home=None) -> sqlite3.Connection:
         ("delivery_channel", "TEXT NOT NULL DEFAULT 'legacy_queue'"),
         ("delivery_namespace", "TEXT NOT NULL DEFAULT ''"),
         ("delivery_owner", "TEXT NOT NULL DEFAULT ''"),
+        ("delivery_store", "TEXT NOT NULL DEFAULT ''"),
         ("discarded_reason", "TEXT"),
     ):
         if name not in columns:
@@ -162,23 +164,12 @@ def _delivery_route(record: Dict[str, Any]) -> Dict[str, str]:
         "channel": str(route.get("channel") or "legacy_queue"),
         "namespace": str(route.get("namespace") or ""),
         "owner": str(route.get("owner") or ""),
+        "store": str(route.get("store") or ""),
     }
 
 
-def _webui_backlog_full(route: Dict[str, str], hermes_home=None) -> bool:
-    if route.get("channel") != "webui":
-        return False
-    with _DB_LOCK, _connect(hermes_home) as conn:
-        count = conn.execute(
-            """SELECT COUNT(*) FROM async_delegations
-               WHERE delivery_channel='webui' AND delivery_namespace=?
-                 AND delivery_state='pending'""",
-            (route.get("namespace", ""),),
-        ).fetchone()[0]
-    return count >= _MAX_DURABLE_PENDING
-
-
-def _persist_dispatch(record: Dict[str, Any]) -> None:
+def _persist_dispatch(record: Dict[str, Any]) -> bool:
+    """Persist dispatch, atomically enforcing the WebUI pending-row bound."""
     now = time.time()
     try:
         from gateway.status import get_process_start_time
@@ -192,34 +183,50 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         if key in record
     }
     route = _delivery_route(record)
-    with _DB_LOCK, _connect() as conn:
+    hermes_home = route["store"] or None
+    with _DB_LOCK, _connect(hermes_home) as conn:
+        # BEGIN IMMEDIATE makes admission + insertion one cross-process SQLite
+        # transaction; concurrent WebUI dispatchers cannot all pass the bound.
+        conn.execute("BEGIN IMMEDIATE")
+        if route["channel"] == "webui":
+            count = conn.execute(
+                """SELECT COUNT(*) FROM async_delegations
+                   WHERE delivery_channel='webui' AND delivery_namespace=?
+                     AND delivery_state='pending'""",
+                (route["namespace"],),
+            ).fetchone()[0]
+            if count >= _MAX_DURABLE_PENDING:
+                conn.rollback()
+                return False
         conn.execute(
             """INSERT OR REPLACE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
                 owner_started_at, task_json, delivery_channel,
-                delivery_namespace, delivery_owner)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
+                delivery_namespace, delivery_owner, delivery_store)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
              owner_started_at, json.dumps(task_payload), route["channel"],
-             route["namespace"], route["owner"]),
+             route["namespace"], route["owner"], route["store"]),
         )
-    _prune_durable_records()
+        conn.commit()
+    _prune_durable_records(hermes_home=hermes_home)
+    return True
 
 
-def _delete_durable_delegation(delegation_id: str) -> None:
-    with _DB_LOCK, _connect() as conn:
+def _delete_durable_delegation(delegation_id: str, *, hermes_home=None) -> None:
+    with _DB_LOCK, _connect(hermes_home) as conn:
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
 
 
-def _prune_durable_records() -> None:
+def _prune_durable_records(*, hermes_home=None) -> None:
     """Bound acknowledged history without ever deleting pending WebUI work."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _connect(hermes_home) as conn:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
             (cutoff,),
@@ -258,7 +265,7 @@ def _prune_durable_records() -> None:
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _connect(event.get("delivery_store") or None) as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state='pending'
@@ -289,12 +296,12 @@ def recover_abandoned_delegations(*, hermes_home=None) -> int:
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, delivery_channel,
-                      delivery_namespace, delivery_owner
+                      delivery_namespace, delivery_owner, delivery_store
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
-             pid, started, task_json, channel, namespace, owner) = row
+             pid, started, task_json, channel, namespace, owner, store) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -315,6 +322,7 @@ def recover_abandoned_delegations(*, hermes_home=None) -> int:
                 "delivery_channel": channel or "legacy_queue",
                 "delivery_namespace": namespace or "",
                 "delivery_owner": owner or "",
+                "delivery_store": store or "",
                 "is_batch": bool(task.get("is_batch")),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
@@ -368,6 +376,8 @@ def restore_undelivered_completions(
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
+                if channel == "webui":
+                    evt["delivery_store"] = str(Path(str(hermes_home)).expanduser().resolve())
             target_queue.put(evt)
     return len(rows)
 
@@ -487,13 +497,13 @@ def discard_completion_delivery(
         return cur.rowcount == 1
 
 
-def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
-    with _DB_LOCK, _connect() as conn:
+def get_durable_delegation(delegation_id: str, *, hermes_home=None) -> Optional[Dict[str, Any]]:
+    with _DB_LOCK, _connect(hermes_home) as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
                       delivery_channel, delivery_namespace, delivery_owner,
-                      discarded_reason
+                      delivery_store, discarded_reason
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -504,7 +514,8 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "delivery_channel": row[7], "delivery_namespace": row[8],
-        "delivery_owner": row[9], "discarded_reason": row[10],
+        "delivery_owner": row[9], "delivery_store": row[10],
+        "discarded_reason": row[11],
     }
 
 
@@ -606,10 +617,10 @@ def dispatch_async_delegation(
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
     route = _delivery_route({"delivery_route": delivery_route})
-    if route["channel"] == "webui" and (not route["namespace"] or not route["owner"]):
+    if route["channel"] == "webui" and (
+        not route["namespace"] or not route["owner"] or not route["store"]
+    ):
         return {"status": "rejected", "error": "Invalid WebUI async delivery route."}
-    if _webui_backlog_full(route):
-        return {"status": "rejected", "error": "WebUI async delegation backlog is full; retry after pending results are delivered."}
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -649,7 +660,10 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    if not _persist_dispatch(record):
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {"status": "rejected", "error": "WebUI async delegation backlog is full; retry after pending results are delivered."}
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -678,7 +692,7 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _delete_durable_delegation(delegation_id, hermes_home=route["store"] or None)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -744,6 +758,7 @@ def _push_completion_event(
         "delivery_channel": route["channel"],
         "delivery_namespace": route["namespace"],
         "delivery_owner": route["owner"],
+        "delivery_store": route["store"],
         "status": status,
         "summary": summary,
         "error": error,
@@ -832,10 +847,10 @@ def dispatch_async_delegation_batch(
     capacity.
     """
     route = _delivery_route({"delivery_route": delivery_route})
-    if route["channel"] == "webui" and (not route["namespace"] or not route["owner"]):
+    if route["channel"] == "webui" and (
+        not route["namespace"] or not route["owner"] or not route["store"]
+    ):
         return {"status": "rejected", "error": "Invalid WebUI async delivery route."}
-    if _webui_backlog_full(route):
-        return {"status": "rejected", "error": "WebUI async delegation backlog is full; retry after pending results are delivered."}
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -878,7 +893,10 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    if not _persist_dispatch(record):
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return {"status": "rejected", "error": "WebUI async delegation backlog is full; retry after pending results are delivered."}
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -912,7 +930,7 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        _delete_durable_delegation(delegation_id, hermes_home=route["store"] or None)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",

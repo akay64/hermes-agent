@@ -2954,7 +2954,7 @@ def delegate_task(
                     _session_key = _agent_session_id
         except Exception:
             _origin_ui_session_id = ""
-            _delivery_route = {"channel": "legacy_queue", "namespace": "", "owner": ""}
+            _delivery_route = {"channel": "legacy_queue", "namespace": "", "owner": "", "store": ""}
         if not _session_key:
             # CLI (single-process) path: the approval contextvar is only bound
             # during gateway/TUI turns and HERMES_SESSION_KEY is not in the CLI

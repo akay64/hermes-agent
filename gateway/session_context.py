@@ -122,21 +122,22 @@ LEGACY_ASYNC_DELIVERY_CHANNEL = "legacy_queue"
 
 def _normalize_async_delivery_route(route: Optional[Dict[str, Any]]) -> Dict[str, str]:
     if route is None:
-        return {"channel": LEGACY_ASYNC_DELIVERY_CHANNEL, "namespace": "", "owner": ""}
+        return {"channel": LEGACY_ASYNC_DELIVERY_CHANNEL, "namespace": "", "owner": "", "store": ""}
     if not isinstance(route, dict):
         raise ValueError("async delivery route must be a mapping")
     channel = str(route.get("channel") or "").strip()
     namespace = str(route.get("namespace") or "").strip()
     owner = str(route.get("owner") or "").strip()
+    store = str(route.get("store") or "").strip()
     if channel == LEGACY_ASYNC_DELIVERY_CHANNEL:
-        if namespace or owner:
-            raise ValueError("legacy_queue route cannot carry namespace or owner")
+        if namespace or owner or store:
+            raise ValueError("legacy_queue route cannot carry namespace, owner, or store")
     elif channel == "webui":
-        if not namespace or not owner:
-            raise ValueError("webui async delivery requires namespace and owner")
+        if not namespace or not owner or not store:
+            raise ValueError("webui async delivery requires namespace, owner, and store")
     else:
         raise ValueError(f"unsupported async delivery channel: {channel or '<empty>'}")
-    return {"channel": channel, "namespace": namespace, "owner": owner}
+    return {"channel": channel, "namespace": namespace, "owner": owner, "store": store}
 
 
 def bind_async_delivery_route(route: Dict[str, Any]):

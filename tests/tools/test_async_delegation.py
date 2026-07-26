@@ -429,7 +429,7 @@ def test_webui_completion_uses_only_named_sink_and_owner_scoped_claim(tmp_path, 
         model="deepseek", model_provider="delegate-provider",
         session_key="parent", parent_session_id="parent",
         origin_ui_session_id="parent",
-        delivery_route={"channel": "webui", "namespace": "install-a", "owner": "parent"},
+        delivery_route={"channel": "webui", "namespace": "install-a", "owner": "parent", "store": os.environ["HERMES_HOME"]},
         runner=lambda: {"status": "completed", "summary": "done", "model": "deepseek",
                         "model_provider": "delegate-provider"},
     )
@@ -470,6 +470,7 @@ def test_webui_restore_is_filtered_from_legacy_queue(tmp_path, monkeypatch):
         goal="restore", context=None, toolsets=None, role="leaf", model="m",
         session_key="parent", delivery_route={
             "channel": "webui", "namespace": "install-a", "owner": "parent",
+            "store": os.environ["HERMES_HOME"],
         }, runner=lambda: {"status": "completed", "summary": "pending"},
     )
     deadline = time.monotonic() + 5
@@ -491,7 +492,7 @@ def test_webui_restore_is_filtered_from_legacy_queue(tmp_path, monkeypatch):
 def test_pending_webui_backlog_rejects_without_pruning(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 1)
-    route = {"channel": "webui", "namespace": "install-a", "owner": "parent"}
+    route = {"channel": "webui", "namespace": "install-a", "owner": "parent", "store": str(tmp_path)}
     first = ad.dispatch_async_delegation(
         goal="first", context=None, toolsets=None, role="leaf", model="m",
         session_key="parent", delivery_route=route,
@@ -507,6 +508,44 @@ def test_pending_webui_backlog_rejects_without_pruning(tmp_path, monkeypatch):
     assert second["status"] == "rejected"
     assert "backlog" in second["error"].lower()
     assert ad.get_durable_delegation(first["delegation_id"])["delivery_state"] == "pending"
+
+
+def test_webui_backlog_admission_is_atomic_across_concurrent_dispatches(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 1)
+    route = {
+        "channel": "webui", "namespace": "install-a", "owner": "parent",
+        "store": str(tmp_path),
+    }
+    gate = threading.Barrier(3)
+    release = threading.Event()
+    results = []
+
+    def runner():
+        release.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    def dispatch(index):
+        gate.wait()
+        results.append(ad.dispatch_async_delegation(
+            goal=f"concurrent-{index}", context=None, toolsets=None, role="leaf",
+            model="m", session_key="parent", delivery_route=route,
+            runner=runner, max_async_children=3,
+        ))
+
+    threads = [threading.Thread(target=dispatch, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    gate.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+    release.set()
+
+    assert sorted(result["status"] for result in results) == ["dispatched", "rejected"]
+    with ad._connect(tmp_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM async_delegations WHERE delivery_channel='webui'"
+        ).fetchone()[0] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -978,7 +1017,7 @@ r = ad.dispatch_async_delegation(
     goal='isolated', context=None, toolsets=None, role='leaf', model='child',
     model_provider='delegate-provider', session_key='parent',
     parent_session_id='parent', origin_ui_session_id='parent',
-    delivery_route={'channel':'webui','namespace':'install-a','owner':'parent'},
+    delivery_route={'channel':'webui','namespace':'install-a','owner':'parent','store':__import__('os').environ['HERMES_HOME']},
     runner=lambda: {'status':'completed','summary':'done'},
 )
 while ad.active_count(): time.sleep(.01)
@@ -1045,6 +1084,7 @@ def test_webui_batch_completion_uses_private_sink_with_child_provenance(
             "channel": "webui",
             "namespace": "install-a",
             "owner": "parent",
+            "store": str(tmp_path),
         },
         runner=lambda: {
             "results": [
