@@ -37,7 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Dict, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -113,6 +113,48 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # setting ``supports_async_delivery = False`` on the adapter class; the gateway
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
+
+# Immutable return address for detached work. Native hosts intentionally leave
+# this unset and retain the historical shared completion-queue path.
+_ASYNC_DELIVERY_ROUTE: ContextVar = ContextVar("HERMES_ASYNC_DELIVERY_ROUTE", default=_UNSET)
+LEGACY_ASYNC_DELIVERY_CHANNEL = "legacy_queue"
+
+
+def _normalize_async_delivery_route(route: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if route is None:
+        return {"channel": LEGACY_ASYNC_DELIVERY_CHANNEL, "namespace": "", "owner": ""}
+    if not isinstance(route, dict):
+        raise ValueError("async delivery route must be a mapping")
+    channel = str(route.get("channel") or "").strip()
+    namespace = str(route.get("namespace") or "").strip()
+    owner = str(route.get("owner") or "").strip()
+    if channel == LEGACY_ASYNC_DELIVERY_CHANNEL:
+        if namespace or owner:
+            raise ValueError("legacy_queue route cannot carry namespace or owner")
+    elif channel == "webui":
+        if not namespace or not owner:
+            raise ValueError("webui async delivery requires namespace and owner")
+    else:
+        raise ValueError(f"unsupported async delivery channel: {channel or '<empty>'}")
+    return {"channel": channel, "namespace": namespace, "owner": owner}
+
+
+def bind_async_delivery_route(route: Dict[str, Any]):
+    """Bind a validated detached-completion route for the current turn."""
+    return _ASYNC_DELIVERY_ROUTE.set(_normalize_async_delivery_route(route))
+
+
+def reset_async_delivery_route(token) -> None:
+    """Restore the route that preceded :func:`bind_async_delivery_route`."""
+    _ASYNC_DELIVERY_ROUTE.reset(token)
+
+
+def get_async_delivery_route() -> Dict[str, str]:
+    """Return the current route; context-unaware callers use legacy_queue."""
+    value = _ASYNC_DELIVERY_ROUTE.get()
+    if value is _UNSET:
+        return _normalize_async_delivery_route(None)
+    return dict(value)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -245,6 +287,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _ASYNC_DELIVERY_ROUTE.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -293,6 +336,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _ASYNC_DELIVERY_ROUTE.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

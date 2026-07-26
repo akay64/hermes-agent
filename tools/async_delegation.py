@@ -43,6 +43,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -78,14 +79,16 @@ _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 _DB_LOCK = threading.Lock()
+_DELIVERY_SINKS_LOCK = threading.Lock()
+_DELIVERY_SINKS: Dict[tuple[str, str], Callable[[Dict[str, Any]], None]] = {}
 
 
-def _db_path():
-    return get_hermes_home() / "state.db"
+def _db_path(hermes_home=None):
+    return Path(hermes_home) / "state.db" if hermes_home else get_hermes_home() / "state.db"
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _connect(hermes_home=None) -> sqlite3.Connection:
+    path = _db_path() if hermes_home is None else _db_path(hermes_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -108,7 +111,11 @@ def _connect() -> sqlite3.Connection:
             owner_started_at INTEGER,
             task_json TEXT,
             delivery_claim TEXT,
-            delivery_claimed_at REAL
+            delivery_claimed_at REAL,
+            delivery_channel TEXT NOT NULL DEFAULT 'legacy_queue',
+            delivery_namespace TEXT NOT NULL DEFAULT '',
+            delivery_owner TEXT NOT NULL DEFAULT '',
+            discarded_reason TEXT
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -118,10 +125,57 @@ def _connect() -> sqlite3.Connection:
         ("task_json", "TEXT"),
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
+        ("delivery_channel", "TEXT NOT NULL DEFAULT 'legacy_queue'"),
+        ("delivery_namespace", "TEXT NOT NULL DEFAULT ''"),
+        ("delivery_owner", "TEXT NOT NULL DEFAULT ''"),
+        ("discarded_reason", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
     return conn
+
+
+def register_completion_sink(channel: str, namespace: str, sink: Callable[[Dict[str, Any]], None]) -> None:
+    """Register one process-local notification sink for a durable route."""
+    key = (str(channel or "").strip(), str(namespace or "").strip())
+    if key[0] == "legacy_queue" or not all(key) or not callable(sink):
+        raise ValueError("named completion sinks require non-legacy channel, namespace, and callable")
+    with _DELIVERY_SINKS_LOCK:
+        if key in _DELIVERY_SINKS and _DELIVERY_SINKS[key] is not sink:
+            raise RuntimeError(f"completion sink already registered for {key[0]}:{key[1]}")
+        _DELIVERY_SINKS[key] = sink
+
+
+def unregister_completion_sink(channel: str, namespace: str, sink=None) -> bool:
+    key = (str(channel or "").strip(), str(namespace or "").strip())
+    with _DELIVERY_SINKS_LOCK:
+        current = _DELIVERY_SINKS.get(key)
+        if current is None or (sink is not None and current is not sink):
+            return False
+        del _DELIVERY_SINKS[key]
+        return True
+
+
+def _delivery_route(record: Dict[str, Any]) -> Dict[str, str]:
+    route = record.get("delivery_route") or {}
+    return {
+        "channel": str(route.get("channel") or "legacy_queue"),
+        "namespace": str(route.get("namespace") or ""),
+        "owner": str(route.get("owner") or ""),
+    }
+
+
+def _webui_backlog_full(route: Dict[str, str], hermes_home=None) -> bool:
+    if route.get("channel") != "webui":
+        return False
+    with _DB_LOCK, _connect(hermes_home) as conn:
+        count = conn.execute(
+            """SELECT COUNT(*) FROM async_delegations
+               WHERE delivery_channel='webui' AND delivery_namespace=?
+                 AND delivery_state='pending'""",
+            (route.get("namespace", ""),),
+        ).fetchone()[0]
+    return count >= _MAX_DURABLE_PENDING
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
@@ -133,21 +187,25 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
+        for key in ("goal", "goals", "context", "toolsets", "role", "model",
+                    "model_provider", "is_batch")
         if key in record
     }
+    route = _delivery_route(record)
     with _DB_LOCK, _connect() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?)""",
+                owner_started_at, task_json, delivery_channel,
+                delivery_namespace, delivery_owner)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload)),
+             owner_started_at, json.dumps(task_payload), route["channel"],
+             route["namespace"], route["owner"]),
         )
     _prune_durable_records()
 
@@ -158,7 +216,7 @@ def _delete_durable_delegation(delegation_id: str) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound acknowledged history without ever deleting pending WebUI work."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _connect() as conn:
@@ -167,22 +225,23 @@ def _prune_durable_records() -> None:
             (cutoff,),
         )
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+            """SELECT COUNT(*) FROM async_delegations
+               WHERE state NOT IN ('running','finalizing')"""
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
+                     WHERE delivery_state IN ('delivered','discarded')
+                     ORDER BY updated_at ASC LIMIT ?
                    )""",
                 (excess,),
             )
         pending_count = conn.execute(
             """SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'"""
+               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                 AND delivery_channel='legacy_queue'"""
         ).fetchone()[0]
         overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
         if overflow:
@@ -190,6 +249,7 @@ def _prune_durable_records() -> None:
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                       AND delivery_channel='legacy_queue'
                      ORDER BY updated_at ASC LIMIT ?
                    )""",
                 (overflow,),
@@ -216,7 +276,7 @@ def _note_delivery_attempt(delegation_id: str) -> None:
         )
 
 
-def recover_abandoned_delegations() -> int:
+def recover_abandoned_delegations(*, hermes_home=None) -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
@@ -224,15 +284,17 @@ def recover_abandoned_delegations() -> int:
         return 0
     now = time.time()
     recovered = 0
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _connect(hermes_home) as conn:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json
+                      owner_started_at, task_json, delivery_channel,
+                      delivery_namespace, delivery_owner
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
-            delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json = row
+            (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
+             pid, started, task_json, channel, namespace, owner) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -247,7 +309,13 @@ def recover_abandoned_delegations() -> int:
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
-                "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+                "model": task.get("model"), "model_provider": task.get("model_provider"),
+                "child_model": task.get("model"),
+                "child_model_provider": task.get("model_provider"),
+                "delivery_channel": channel or "legacy_queue",
+                "delivery_namespace": namespace or "",
+                "delivery_owner": owner or "",
+                "is_batch": bool(task.get("is_batch")),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
@@ -263,7 +331,10 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
-def restore_undelivered_completions(target_queue) -> int:
+def restore_undelivered_completions(
+    target_queue, *, channel: str = "legacy_queue", namespace: str = "",
+    owner: Optional[str] = None, hermes_home=None,
+) -> int:
     """Enqueue durable pending completions as fresh turns after process start.
 
     Every restored event is stamped ``restored=True`` (in-memory only — the
@@ -275,12 +346,23 @@ def restore_undelivered_completions(target_queue) -> int:
     otherwise a brand-new session adopts a dead session's delegation
     results seconds after boot (#64484).
     """
-    recover_abandoned_delegations()
-    with _DB_LOCK, _connect() as conn:
+    recover_abandoned_delegations(hermes_home=hermes_home)
+    if channel == "webui" and not namespace:
+        raise ValueError("webui restoration requires a namespace")
+    with _DB_LOCK, _connect(hermes_home) as conn:
+        where = [
+            "state != 'running'", "delivery_state='pending'",
+            "event_json IS NOT NULL", "delivery_channel=?",
+            "delivery_namespace=?",
+        ]
+        params: list[Any] = [channel, namespace]
+        if owner is not None:
+            where.append("delivery_owner=?")
+            params.append(owner)
         rows = conn.execute(
-            """SELECT delegation_id, event_json FROM async_delegations
-               WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
-               ORDER BY completed_at, delegation_id"""
+            "SELECT delegation_id, event_json FROM async_delegations WHERE "
+            + " AND ".join(where) + " ORDER BY completed_at, delegation_id",
+            params,
         ).fetchall()
         for _delegation_id, payload in rows:
             evt = json.loads(payload)
@@ -302,16 +384,25 @@ def mark_completion_delivered(delegation_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def claim_completion_delivery(
+    delegation_id: str, claim_id: str, *, expected_channel: str = "legacy_queue",
+    expected_namespace: str = "", expected_owner: Optional[str] = None,
+    hermes_home=None,
+) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _connect(hermes_home) as conn:
         row = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            """SELECT delivery_state, delivery_channel, delivery_namespace,
+                      delivery_owner FROM async_delegations WHERE delegation_id=?""",
             (delegation_id,),
         ).fetchone()
         if row is None:
-            return True  # legacy event created before durable dispatch
+            return expected_channel == "legacy_queue"  # pre-durable legacy event
+        if row[1] != expected_channel or row[2] != expected_namespace:
+            return False
+        if expected_owner is not None and row[3] != expected_owner:
+            return False
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
@@ -322,7 +413,11 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
+def claim_event_delivery(
+    evt: Dict[str, Any], consumer: str, *, expected_channel: str = "legacy_queue",
+    expected_namespace: str = "", expected_owner: Optional[str] = None,
+    hermes_home=None,
+) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
     if evt.get("type") != "async_delegation":
         return ""
@@ -330,12 +425,16 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     if not delegation_id:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
-    return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+    return claim_id if claim_completion_delivery(
+        delegation_id, claim_id, expected_channel=expected_channel,
+        expected_namespace=expected_namespace, expected_owner=expected_owner,
+        hermes_home=hermes_home,
+    ) else None
 
 
-def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def release_completion_delivery(delegation_id: str, claim_id: str, *, hermes_home=None) -> bool:
     """Release a failed delivery claim so another consumer may retry."""
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _connect(hermes_home) as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=NULL,
                       delivery_claimed_at=NULL, updated_at=?
@@ -346,10 +445,10 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def complete_completion_delivery(delegation_id: str, claim_id: str, *, hermes_home=None) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _connect(hermes_home) as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
@@ -371,11 +470,30 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
+def discard_completion_delivery(
+    delegation_id: str, claim_id: str, reason: str, *, hermes_home=None,
+) -> bool:
+    """Terminally discard an undeliverable completion held by the claimant."""
+    now = time.time()
+    with _DB_LOCK, _connect(hermes_home) as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_state='discarded',
+                      discarded_reason=?, updated_at=?, delivery_claim=NULL,
+                      delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (str(reason or "unspecified"), now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
-                      result_json, delivery_state, delivery_attempts
+                      result_json, delivery_state, delivery_attempts,
+                      delivery_channel, delivery_namespace, delivery_owner,
+                      discarded_reason
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -385,6 +503,8 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "dispatched_at": row[2], "completed_at": row[3],
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
+        "delivery_channel": row[7], "delivery_namespace": row[8],
+        "delivery_owner": row[9], "discarded_reason": row[10],
     }
 
 
@@ -446,6 +566,8 @@ def dispatch_async_delegation(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    model_provider: Optional[str] = None,
+    delivery_route: Optional[Dict[str, str]] = None,
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
 ) -> Dict[str, Any]:
@@ -483,6 +605,11 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    route = _delivery_route({"delivery_route": delivery_route})
+    if route["channel"] == "webui" and (not route["namespace"] or not route["owner"]):
+        return {"status": "rejected", "error": "Invalid WebUI async delivery route."}
+    if _webui_backlog_full(route):
+        return {"status": "rejected", "error": "WebUI async delegation backlog is full; retry after pending results are delivered."}
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -492,6 +619,8 @@ def dispatch_async_delegation(
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
         "model": model,
+        "model_provider": model_provider,
+        "delivery_route": route,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "parent_session_id": parent_session_id,
@@ -592,20 +721,13 @@ def _push_completion_event(
     Best-effort: a failure here must not crash the worker, but it WOULD mean a
     silently-lost result, so we log loudly.
     """
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
-        return
-
     summary = result.get("summary")
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
     completed_at = record.get("completed_at") or time.time()
+    route = _delivery_route(record)
+    child_model = result.get("model") or record.get("model")
+    child_provider = result.get("model_provider") or result.get("provider") or record.get("model_provider")
 
     evt = {
         "type": "async_delegation",
@@ -619,7 +741,13 @@ def _push_completion_event(
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
         "role": record.get("role"),
-        "model": result.get("model") or record.get("model"),
+        "model": child_model,
+        "model_provider": child_provider,
+        "child_model": child_model,
+        "child_model_provider": child_provider,
+        "delivery_channel": route["channel"],
+        "delivery_namespace": route["namespace"],
+        "delivery_owner": route["owner"],
         "status": status,
         "summary": summary,
         "error": error,
@@ -632,7 +760,25 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     _persist_completion(evt, result)
+    if route["channel"] != "legacy_queue":
+        with _DELIVERY_SINKS_LOCK:
+            sink = _DELIVERY_SINKS.get((route["channel"], route["namespace"]))
+        if sink is None:
+            logger.info(
+                "Async delegation %s persisted for unavailable %s:%s sink",
+                record.get("delegation_id"), route["channel"], route["namespace"],
+            )
+            return
+        try:
+            sink(dict(evt))
+        except Exception:
+            logger.exception(
+                "Async delegation %s sink notification failed; completion remains pending",
+                record.get("delegation_id"),
+            )
+        return
     try:
+        from tools.process_registry import process_registry
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
         logger.error(
@@ -653,6 +799,8 @@ def dispatch_async_delegation_batch(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    model_provider: Optional[str] = None,
+    delivery_route: Optional[Dict[str, str]] = None,
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
@@ -677,6 +825,11 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    route = _delivery_route({"delivery_route": delivery_route})
+    if route["channel"] == "webui" and (not route["namespace"] or not route["owner"]):
+        return {"status": "rejected", "error": "Invalid WebUI async delivery route."}
+    if _webui_backlog_full(route):
+        return {"status": "rejected", "error": "WebUI async delegation backlog is full; retry after pending results are delivered."}
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -692,6 +845,8 @@ def dispatch_async_delegation_batch(
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
         "model": model,
+        "model_provider": model_provider,
+        "delivery_route": route,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "parent_session_id": parent_session_id,
@@ -938,3 +1093,5 @@ def _reset_for_tests() -> None:
         _executor_max_workers = 0
     with _records_lock:
         _records.clear()
+    with _DELIVERY_SINKS_LOCK:
+        _DELIVERY_SINKS.clear()

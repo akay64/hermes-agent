@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -417,6 +418,95 @@ def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch
     assert ad.complete_completion_delivery("deleg_claim", "consumer-b")
     assert not ad.claim_completion_delivery("deleg_claim", "consumer-c")
     assert ad.get_durable_delegation("deleg_claim")["delivery_state"] == "delivered"
+
+
+def test_webui_completion_uses_only_named_sink_and_owner_scoped_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    delivered = queue.Queue()
+    ad.register_completion_sink("webui", "install-a", delivered.put_nowait)
+    result = ad.dispatch_async_delegation(
+        goal="isolated", context=None, toolsets=None, role="leaf",
+        model="deepseek", model_provider="delegate-provider",
+        session_key="parent", parent_session_id="parent",
+        origin_ui_session_id="parent",
+        delivery_route={"channel": "webui", "namespace": "install-a", "owner": "parent"},
+        runner=lambda: {"status": "completed", "summary": "done", "model": "deepseek",
+                        "model_provider": "delegate-provider"},
+    )
+    evt = delivered.get(timeout=5)
+    assert process_registry.completion_queue.empty()
+    assert evt["delivery_channel"] == "webui"
+    assert evt["child_model"] == evt["model"] == "deepseek"
+    assert evt["child_model_provider"] == evt["model_provider"] == "delegate-provider"
+    assert ad.claim_event_delivery(evt, "native") is None
+    claim = ad.claim_event_delivery(
+        evt, "webui", expected_channel="webui", expected_namespace="install-a",
+        expected_owner="parent", hermes_home=tmp_path,
+    )
+    assert claim
+    assert ad.complete_completion_delivery(result["delegation_id"], claim, hermes_home=tmp_path)
+
+
+def test_new_core_without_delivery_route_preserves_legacy_queue_contract(tmp_path, monkeypatch):
+    """An older host that knows only the boolean capability must remain on the
+    shared native queue after the core is upgraded."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    result = ad.dispatch_async_delegation(
+        goal="legacy host", context=None, toolsets=None, role="leaf",
+        model="child-model", model_provider="child-provider",
+        session_key="legacy-parent", parent_session_id="legacy-parent",
+        runner=lambda: {"status": "completed", "summary": "done"},
+    )
+    evt = process_registry.completion_queue.get(timeout=5)
+    assert evt["delegation_id"] == result["delegation_id"]
+    assert evt["delivery_channel"] == "legacy_queue"
+    assert evt["model"] == evt["child_model"] == "child-model"
+    assert evt["model_provider"] == evt["child_model_provider"] == "child-provider"
+
+
+def test_webui_restore_is_filtered_from_legacy_queue(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad.dispatch_async_delegation(
+        goal="restore", context=None, toolsets=None, role="leaf", model="m",
+        session_key="parent", delivery_route={
+            "channel": "webui", "namespace": "install-a", "owner": "parent",
+        }, runner=lambda: {"status": "completed", "summary": "pending"},
+    )
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+    wrong = queue.Queue()
+    assert ad.restore_undelivered_completions(
+        wrong, channel="webui", namespace="install-b", hermes_home=tmp_path,
+    ) == 0
+    owned = queue.Queue()
+    assert ad.restore_undelivered_completions(
+        owned, channel="webui", namespace="install-a", owner="parent",
+        hermes_home=tmp_path,
+    ) == 1
+    assert owned.get_nowait()["delivery_owner"] == "parent"
+
+
+def test_pending_webui_backlog_rejects_without_pruning(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 1)
+    route = {"channel": "webui", "namespace": "install-a", "owner": "parent"}
+    first = ad.dispatch_async_delegation(
+        goal="first", context=None, toolsets=None, role="leaf", model="m",
+        session_key="parent", delivery_route=route,
+        runner=lambda: {"status": "completed", "summary": "pending"},
+    )
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(.01)
+    second = ad.dispatch_async_delegation(
+        goal="second", context=None, toolsets=None, role="leaf", model="m",
+        session_key="parent", delivery_route=route, runner=lambda: {},
+    )
+    assert second["status"] == "rejected"
+    assert "backlog" in second["error"].lower()
+    assert ad.get_durable_delegation(first["delegation_id"])["delivery_state"] == "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +960,67 @@ def test_gateway_cli_origin_event_left_unrouted():
     runner = object.__new__(GatewayRunner)
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
+    assert runner._build_process_event_source(evt) is None
     assert "platform" not in evt
+
+
+def test_webui_route_is_isolated_from_native_consumer_across_processes(tmp_path):
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(tmp_path)
+    repo = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (repo, env.get("PYTHONPATH", "")) if part
+    )
+    producer = """
+import time
+from tools import async_delegation as ad
+r = ad.dispatch_async_delegation(
+    goal='isolated', context=None, toolsets=None, role='leaf', model='child',
+    model_provider='delegate-provider', session_key='parent',
+    parent_session_id='parent', origin_ui_session_id='parent',
+    delivery_route={'channel':'webui','namespace':'install-a','owner':'parent'},
+    runner=lambda: {'status':'completed','summary':'done'},
+)
+while ad.active_count(): time.sleep(.01)
+print(r['delegation_id'])
+"""
+    first = subprocess.run(
+        [sys.executable, "-c", producer], env=env, cwd=repo,
+        text=True, capture_output=True, timeout=20, check=False,
+    )
+    assert first.returncode == 0, first.stderr
+    delegation_id = first.stdout.strip().splitlines()[-1]
+
+    native = f"""
+import queue
+from tools import async_delegation as ad
+q=queue.Queue()
+print(ad.restore_undelivered_completions(q))
+print(ad.claim_completion_delivery({delegation_id!r}, 'native', expected_channel='legacy_queue'))
+"""
+    second = subprocess.run(
+        [sys.executable, "-c", native], env=env, cwd=repo,
+        text=True, capture_output=True, timeout=20, check=False,
+    )
+    assert second.returncode == 0, second.stderr
+    assert second.stdout.strip().splitlines()[-2:] == ["0", "False"]
+
+    webui = f"""
+import queue
+from tools import async_delegation as ad
+q=queue.Queue()
+print(ad.restore_undelivered_completions(q, channel='webui', namespace='install-a'))
+evt=q.get_nowait()
+claim=ad.claim_event_delivery(evt, 'webui', expected_channel='webui', expected_namespace='install-a', expected_owner='parent')
+print(bool(claim))
+ad.complete_event_delivery(evt, claim)
+print(ad.get_durable_delegation(evt['delegation_id'])['delivery_state'])
+"""
+    third = subprocess.run(
+        [sys.executable, "-c", webui], env=env, cwd=repo,
+        text=True, capture_output=True, timeout=20, check=False,
+    )
+    assert third.returncode == 0, third.stderr
+    assert third.stdout.strip().splitlines()[-3:] == ["1", "True", "delivered"]
 
 

@@ -2936,10 +2936,11 @@ def delegate_task(
         _session_key = get_current_session_key(default="")
         _origin_ui_session_id = ""
         try:
-            from gateway.session_context import get_session_env
+            from gateway.session_context import get_async_delivery_route, get_session_env
 
             _source = get_session_env("HERMES_SESSION_SOURCE", "")
             _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+            _delivery_route = get_async_delivery_route()
             # In desktop/TUI, the routable session key is the durable
             # AIAgent.session_id. Context compression can rotate that id during
             # the same turn before the TUI-side session dict is re-anchored;
@@ -2953,6 +2954,7 @@ def delegate_task(
                     _session_key = _agent_session_id
         except Exception:
             _origin_ui_session_id = ""
+            _delivery_route = {"channel": "legacy_queue", "namespace": "", "owner": ""}
         if not _session_key:
             # CLI (single-process) path: the approval contextvar is only bound
             # during gateway/TUI turns and HERMES_SESSION_KEY is not in the CLI
@@ -3007,8 +3009,10 @@ def delegate_task(
             toolsets=None,
             role=top_role,
             model=creds["model"],
+            model_provider=creds.get("provider"),
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
+            delivery_route=_delivery_route,
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,

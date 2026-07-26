@@ -1206,6 +1206,18 @@ class ProcessRegistry:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
+            if (
+                evt.get("type") == "async_delegation"
+                and str(evt.get("delivery_channel") or "legacy_queue") != "legacy_queue"
+            ):
+                # Named delivery channels never belong on this destructive
+                # native-host queue. Fail closed instead of letting a legacy
+                # consumer claim another host's durable completion.
+                logger.error(
+                    "Rejected non-legacy async delegation %s from completion_queue",
+                    evt.get("delegation_id"),
+                )
+                continue
             # Positive-proof ownership beats bare key equality. Delegation
             # payloads always require proof; ordinary events require it once
             # they carry routing metadata. Ownerless ordinary events preserve
