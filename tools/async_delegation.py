@@ -716,11 +716,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
 def _push_completion_event(
     record: Dict[str, Any], result: Dict[str, Any], status: str
 ) -> None:
-    """Push a type='async_delegation' event onto the shared completion queue.
-
-    Best-effort: a failure here must not crash the worker, but it WOULD mean a
-    silently-lost result, so we log loudly.
-    """
+    """Persist and notify one async-delegation completion on its captured route."""
     summary = result.get("summary")
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
@@ -759,6 +755,16 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    if record.get("is_batch"):
+        evt.update(
+            {
+                "is_batch": True,
+                "goals": record.get("goals"),
+                "results": result.get("results") or [],
+                "live_transcripts": result.get("live_transcripts"),
+                "total_duration_seconds": result.get("total_duration_seconds"),
+            }
+        )
     _persist_completion(evt, result)
     if route["channel"] != "legacy_queue":
         with _DELIVERY_SINKS_LOCK:
@@ -932,59 +938,12 @@ def _finalize_batch(
         record["interrupt_fn"] = None
         event_record = dict(record)
 
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            delegation_id, exc,
-        )
-        return
-
-    dispatched_at = event_record.get("dispatched_at") or time.time()
-    completed_at = event_record.get("completed_at") or time.time()
-    evt = {
-        "type": "async_delegation",
-        "delegation_id": delegation_id,
-        "session_key": event_record.get("session_key", ""),
-        "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
-        "parent_session_id": event_record.get("parent_session_id"),
-        "goal": event_record.get("goal", ""),
-        "goals": event_record.get("goals"),
-        "context": event_record.get("context"),
-        "toolsets": event_record.get("toolsets"),
-        "role": event_record.get("role"),
-        "model": event_record.get("model"),
-        "status": status,
-        "is_batch": True,
-        # The full per-task results list — the formatter renders a
-        # consolidated multi-task block from this.
-        "results": combined.get("results") or [],
-        # Per-task live transcript log paths (cache/delegation/live/...).
-        # They persist after completion and double as the full-fidelity
-        # operational record of each child's run.
-        "live_transcripts": combined.get("live_transcripts"),
-        "error": combined.get("error"),
-        "total_duration_seconds": combined.get("total_duration_seconds"),
-        "dispatched_at": dispatched_at,
-        "completed_at": completed_at,
-    }
-    _persist_completion(evt, combined)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
-            delegation_id, exc,
-        )
-    finally:
-        with _records_lock:
-            record = _records.get(delegation_id)
-            if record is not None:
-                record["status"] = status
-            _prune_completed_locked()
+    _push_completion_event(event_record, combined, status)
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None:
+            record["status"] = status
+        _prune_completed_locked()
 
 
 def list_async_delegations() -> List[Dict[str, Any]]:

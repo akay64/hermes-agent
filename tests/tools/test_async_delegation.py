@@ -1024,3 +1024,65 @@ print(ad.get_durable_delegation(evt['delegation_id'])['delivery_state'])
     assert third.stdout.strip().splitlines()[-3:] == ["1", "True", "delivered"]
 
 
+def test_webui_batch_completion_uses_private_sink_with_child_provenance(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    received = queue.Queue()
+    ad.register_completion_sink("webui", "install-a", received.put_nowait)
+
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["first", "second"],
+        context="ctx",
+        toolsets=None,
+        role="leaf",
+        model="child-model",
+        model_provider="child-provider",
+        session_key="parent",
+        parent_session_id="parent",
+        origin_ui_session_id="parent",
+        delivery_route={
+            "channel": "webui",
+            "namespace": "install-a",
+            "owner": "parent",
+        },
+        runner=lambda: {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "one"},
+                {"task_index": 1, "status": "completed", "summary": "two"},
+            ],
+            "live_transcripts": ["one.log", "two.log"],
+            "total_duration_seconds": 1.25,
+        },
+    )
+
+    evt = received.get(timeout=5)
+    assert evt["delegation_id"] == dispatched["delegation_id"]
+    assert evt["delivery_channel"] == "webui"
+    assert evt["delivery_namespace"] == "install-a"
+    assert evt["delivery_owner"] == "parent"
+    assert evt["child_model"] == evt["model"] == "child-model"
+    assert evt["child_model_provider"] == evt["model_provider"] == "child-provider"
+    assert evt["is_batch"] is True
+    assert [item["summary"] for item in evt["results"]] == ["one", "two"]
+    assert process_registry.completion_queue.empty()
+
+    durable = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "pending"
+    assert durable["delivery_channel"] == "webui"
+    assert durable["delivery_namespace"] == "install-a"
+    assert durable["delivery_owner"] == "parent"
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(
+        restored,
+        channel="webui",
+        namespace="install-a",
+        owner="parent",
+    ) == 1
+    restored_evt = restored.get_nowait()
+    assert restored_evt["delivery_channel"] == "webui"
+    assert restored_evt["child_model_provider"] == "child-provider"
+
+
