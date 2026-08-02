@@ -383,20 +383,29 @@ class TestUpdateFromResponse:
     def test_missing_fields_default_zero(self, compressor):
         compressor.update_from_response({})
         assert compressor.last_prompt_tokens == 0
+        assert compressor.last_real_prompt_tokens == 0
 
 class TestPreflightDeferral:
-    def test_defers_when_recent_real_usage_fit_and_rough_growth_is_small(self, compressor):
+    def test_defers_when_recent_real_usage_fit(self, compressor):
         compressor.threshold_tokens = 85_000
         compressor.last_real_prompt_tokens = 50_000
         compressor.last_rough_tokens_when_real_prompt_fit = 90_000
 
         assert compressor.should_defer_preflight_to_real_usage(93_000) is True
-        assert compressor.last_rough_tokens_when_real_prompt_fit == 93_000
 
-    def test_does_not_defer_when_rough_growth_is_large(self, compressor):
+    def test_defers_when_rough_growth_is_large_but_real_usage_fits(self, compressor):
         compressor.threshold_tokens = 85_000
         compressor.last_real_prompt_tokens = 50_000
         compressor.last_rough_tokens_when_real_prompt_fit = 90_000
+
+        assert compressor.should_defer_preflight_to_real_usage(100_000) is True
+
+    def test_usage_less_update_restores_estimator_authority(self, compressor):
+        compressor.threshold_tokens = 85_000
+        compressor.last_real_prompt_tokens = 50_000
+        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
+
+        compressor.update_from_response({})
 
         assert compressor.should_defer_preflight_to_real_usage(100_000) is False
 
@@ -419,9 +428,7 @@ class TestPreflightDeferral:
         compressor.awaiting_real_usage_after_compression = True
         assert compressor.should_defer_preflight_to_real_usage(95_000) is True
 
-    def test_resumes_normal_deferral_after_flag_cleared(self, compressor):
-        """Once update_from_response() clears the flag, the normal baseline/
-        growth deferral logic governs again (no permanent deferral)."""
+    def test_does_not_defer_when_real_usage_is_over_threshold(self, compressor):
         compressor.threshold_tokens = 85_000
         compressor.last_real_prompt_tokens = 120_000
         compressor.awaiting_real_usage_after_compression = False

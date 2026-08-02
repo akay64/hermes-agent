@@ -825,8 +825,8 @@ class TestPreflightCompression:
             for ev, msg in status_messages
         )
 
-    def test_preflight_compresses_when_rough_growth_after_fit_is_large(self, agent):
-        """Large rough growth after a fitting request still triggers preflight."""
+    def test_does_not_preflight_compress_when_rough_growth_after_fit_is_large(self, agent):
+        """Large rough growth does not override a fitting real reading."""
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
@@ -846,13 +846,10 @@ class TestPreflightCompression:
         )
         agent.client.chat.completions.create.side_effect = [ok_resp]
 
-        # First rough estimate must clear the threshold so preflight fires
-        # (rough growth since the last fitting request is large, so the
-        # deferral path is NOT taken). Every estimate after compaction is
-        # sub-threshold. Use a callable side_effect rather than a fixed list
-        # so we don't have to predict how many times the loop re-estimates —
-        # the post-response real-token estimate is an extra call that a
-        # 2-element list would exhaust (StopIteration).
+        # A fitting real reading defers preflight even when rough growth is large.
+        # Every estimate after the first is sub-threshold. Use a callable
+        # side_effect rather than a fixed list so we don't have to predict how
+        # many times the loop re-estimates.
         _rough_calls = {"n": 0}
 
         def _rough_estimate(*_args, **_kwargs):
@@ -873,8 +870,53 @@ class TestPreflightCompression:
             )
             result = agent.run_conversation("hello", conversation_history=big_history)
 
-        mock_compress.assert_called_once()
+        mock_compress.assert_not_called()
         assert result["completed"] is True
+
+    def test_usage_less_response_restores_preflight_estimator_authority(self, agent):
+        """A usage-less response clears a prior fitting real-usage reading."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+
+        big_history = []
+        for i in range(20):
+            big_history.append({"role": "user", "content": f"Message {i} padded"})
+            big_history.append({"role": "assistant", "content": f"Response {i} padded"})
+
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="Fitting usage",
+                usage={"prompt_tokens": 50_000, "completion_tokens": 100, "total_tokens": 50_100},
+            ),
+            _mock_response(content="Usage omitted"),
+            _mock_response(content="After preflight"),
+        ]
+        rough_calls = {"n": 0}
+
+        def _rough_estimate(*_args, **_kwargs):
+            rough_calls["n"] += 1
+            return 125_000 if rough_calls["n"] in {2, 3} else 40_000
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
+                "new system prompt",
+            )
+            first = agent.run_conversation("first", conversation_history=big_history)
+            second = agent.run_conversation("second", conversation_history=big_history)
+            third = agent.run_conversation("third", conversation_history=big_history)
+
+        assert first["completed"] is True
+        assert second["completed"] is True
+        assert third["completed"] is True
+        mock_compress.assert_called_once()
 
     def test_no_preflight_when_under_threshold(self, agent):
         """When history fits within context, no preflight compression needed."""
@@ -981,7 +1023,11 @@ class TestPreflightCompression:
             big_history.append({"role": "user", "content": f"Message {i} padded text"})
             big_history.append({"role": "assistant", "content": f"Response {i} padded text"})
 
-        ok_resp = _mock_response(content="After preflight", finish_reason="stop")
+        ok_resp = _mock_response(
+            content="After preflight",
+            finish_reason="stop",
+            usage={"prompt_tokens": 144_669, "completion_tokens": 100, "total_tokens": 144_769},
+        )
         agent.client.chat.completions.create.side_effect = [ok_resp]
 
         with (
@@ -1014,7 +1060,11 @@ class TestPreflightCompression:
             big_history.append({"role": "user", "content": f"Message {i} padded text"})
             big_history.append({"role": "assistant", "content": f"Response {i} padded text"})
 
-        ok_resp = _mock_response(content="After preflight", finish_reason="stop")
+        ok_resp = _mock_response(
+            content="After preflight",
+            finish_reason="stop",
+            usage={"prompt_tokens": 160_000, "completion_tokens": 100, "total_tokens": 160_100},
+        )
         agent.client.chat.completions.create.side_effect = [ok_resp]
 
         with (

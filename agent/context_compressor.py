@@ -1591,6 +1591,11 @@ class ContextCompressor(ContextEngine):
                         )
                 else:
                     self._ineffective_compression_count = 0
+        else:
+            # Usage-less response: no valid real reading.
+            # Restore estimator authority on both trigger gates.
+            self.last_real_prompt_tokens = 0
+            self.last_rough_tokens_when_real_prompt_fit = 0
         # Consume the pending-verification flag once real usage arrives, whether
         # or not prompt_tokens was reported, so a usage-less response can't leave
         # it armed for a later, unrelated reading.
@@ -1602,11 +1607,11 @@ class ContextCompressor(ContextEngine):
 
         ``estimate_request_tokens_rough(..., tools=...)`` intentionally
         overestimates schema-heavy requests so Hermes compresses before a
-        provider rejects the payload. After a successful compressed API call,
-        though, provider ``prompt_tokens`` are a better signal than repeating
-        compaction from the same rough schema overhead. Defer only while the
-        rough estimate has grown modestly since a request the provider proved
-        fit under the threshold.
+        provider rejects the payload. After a successful API call, though,
+        provider ``prompt_tokens`` are a better signal than repeating
+        compaction from the same rough schema overhead. Defer whenever the
+        latest real reading proved the prompt fit under the threshold; the
+        rough estimate regains authority when no valid reading is available.
         """
         if rough_tokens < self.threshold_tokens:
             return False
@@ -1627,16 +1632,6 @@ class ContextCompressor(ContextEngine):
         if self.last_real_prompt_tokens >= self.threshold_tokens:
             return False
 
-        baseline = self.last_rough_tokens_when_real_prompt_fit or self.last_compression_rough_tokens
-        if baseline <= 0:
-            return False
-
-        growth = max(0, rough_tokens - baseline)
-        tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
-        if growth > tolerated_growth:
-            return False
-
-        self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
 
     def should_compress(self, prompt_tokens: int = None) -> bool:

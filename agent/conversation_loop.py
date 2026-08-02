@@ -2247,16 +2247,11 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
-                elif getattr(
-                    agent.context_compressor,
-                    "awaiting_real_usage_after_compression",
-                    False,
-                ):
+                else:
                     # A response with no usage cannot adjudicate whether the
-                    # prior compaction cleared the threshold. Consume the pending
-                    # verdict now so a much later, unrelated reading is not
-                    # charged to that old compaction, and so preflight deferral
-                    # does not remain latched indefinitely.
+                    # prior compaction cleared the threshold. Restore estimator
+                    # authority now so a later reading is not charged to this
+                    # response, and so preflight deferral does not remain latched.
                     agent.context_compressor.update_from_response({})
 
                 if hasattr(response, 'usage') and response.usage:
