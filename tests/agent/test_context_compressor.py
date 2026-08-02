@@ -4137,6 +4137,27 @@ class TestCompressionSimplification:
         tiny = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
         assert c.has_content_to_compress(tiny) is False
 
+    def test_has_content_to_compress_true_for_argument_truncation_only(self):
+        """Empty-middle transcripts with large historical tool-call
+        arguments (but short tool results) must pass the manual /compress
+        preflight: Pass 3 truncates those arguments, and the preflight
+        must detect that work even though the receipt counter stays at
+        zero."""
+        c = self._compressor()
+        c.tail_token_budget = 500
+        big_args = json.dumps({"content": "z" * 2000})
+        msgs = [{"role": "user", "content": "IMPLEMENT PLAN: do the thing"}]
+        for i in range(6):
+            msgs.append({
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": f"c{i}", "type": "function",
+                                "function": {"name": "write_file", "arguments": big_args}}],
+            })
+            msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "ok"})
+        # Tool results are short (nothing to receipt) — only the arguments
+        # are prunable, which the old counter-based check missed.
+        assert c.has_content_to_compress(msgs) is True
+
     def test_two_ineffective_noops_trip_anti_thrash_gate(self):
         c = self._compressor()
         msgs = self._single_trigger_transcript()

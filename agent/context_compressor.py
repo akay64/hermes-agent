@@ -3515,15 +3515,18 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
         if compress_start < compress_end:
             return True
-        # Empty middle: still useful if a dry-run prune would receipt-ify
-        # old tool results.  The pruner is side-effect free (returns a new
-        # list) and is the same pass compress() runs first.
-        _, pruned_count = self._prune_old_tool_results(
+        # Empty middle: still useful if a dry-run prune would change the
+        # transcript — receipt-ifying old tool results OR truncating large
+        # historical tool-call arguments (Pass 3 rewrites messages without
+        # incrementing the receipt counter, so compare the result instead).
+        # The pruner is side-effect free (returns a new list) and is the
+        # same pass compress() runs first.
+        pruned_messages, _ = self._prune_old_tool_results(
             messages,
             protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,
         )
-        return pruned_count > 0
+        return pruned_messages != messages
 
     # ------------------------------------------------------------------
     # Main compression entry point
