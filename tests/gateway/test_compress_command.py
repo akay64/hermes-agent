@@ -539,3 +539,68 @@ async def test_compress_command_passes_tool_messages_to_compressor():
     # Assistant tool_calls stubs (content=None) must survive too, or the
     # tool message would dangle without its call.
     assert any(m.get("tool_calls") for m in passed), "assistant tool_calls stub dropped"
+
+
+@pytest.mark.asyncio
+async def test_compress_command_runs_pruner_only_for_empty_middle_transcript():
+    """Single-trigger transcripts (one user message, then tool work) have an
+    empty summary middle by design — but manual /compress must STILL invoke
+    compression so the pruner can receipt-ify old tool results.
+
+    Regression: the preflight gate (has_content_to_compress) returned False
+    on every empty-middle transcript, so /compress reported "nothing to do"
+    without calling compress() — removing the manual recovery path once the
+    auto gate has tripped on the two no-op strikes.
+    """
+    from agent.context_compressor import ContextCompressor
+
+    history = [
+        {"role": "user", "content": "IMPLEMENT PLAN: do the thing"},
+    ]
+    for i in range(8):
+        history.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": f"c{i}", "type": "function",
+                            "function": {"name": f"tool_{i}", "arguments": "{}"}}],
+        })
+        history.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 1500})
+
+    # Real compressor: small tail budget so the dry-run prune receipts the
+    # old tool results, and the middle stays empty (single user at the head).
+    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+        compressor = ContextCompressor(
+            model="test/model",
+            quiet_mode=True,
+            protect_last_n=2,
+        )
+        compressor.tail_token_budget = 500
+
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor = compressor
+    agent_instance.session_id = "sess-1"
+    pruned = [history[0], history[1], history[2], history[-1]]
+    agent_instance._compress_context.return_value = (pruned, "")
+
+    def _estimate(messages, **_kwargs):
+        # Full transcript vs pruner-only result.
+        return 500 if len(messages) == len(history) else 120
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    # The preflight must NOT short-circuit: compress is invoked so the
+    # pruner can receipt-ify the old tool results.
+    agent_instance._compress_context.assert_called_once()
+    assert "nothing to do" not in result
+    assert "Compressed:" in result

@@ -3499,15 +3499,31 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
     # ------------------------------------------------------------------
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
-        """Return True if there is a non-empty middle region to compact.
+        """Return True if compress() would do useful work.
 
         Overrides the ABC default so the gateway ``/compress`` guard can
         skip the LLM call when the transcript is still entirely inside
-        the protected head/tail.
+        the protected head/tail.  "Useful work" includes a pruner-only
+        pass: for single-trigger sessions the middle is empty by design,
+        but old tool results may still be receipt-ified (cheap, no LLM) —
+        which is the only degradation available once the auto gate has
+        tripped.  Without this, manual ``/compress`` would report
+        "nothing to do" on the exact transcripts that need the pruner
+        most.
         """
         compress_start = self._align_boundary_forward(messages, self._protect_head_size(messages))
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
-        return compress_start < compress_end
+        if compress_start < compress_end:
+            return True
+        # Empty middle: still useful if a dry-run prune would receipt-ify
+        # old tool results.  The pruner is side-effect free (returns a new
+        # list) and is the same pass compress() runs first.
+        _, pruned_count = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+        )
+        return pruned_count > 0
 
     # ------------------------------------------------------------------
     # Main compression entry point
@@ -3525,10 +3541,14 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
 
         Algorithm:
           1. Prune old tool results (cheap pre-pass, no LLM call)
-          2. Protect head messages (system prompt + first exchange)
+          2. Protect head (system prompt only; the last real user message
+             is anchored in the tail unconditionally)
           3. Find tail boundary by token budget (~20K tokens of recent context)
           4. Summarize middle turns with structured LLM prompt
           5. On re-compression, iteratively update the previous summary
+
+        An empty middle is a legitimate outcome: compress() then returns
+        the pruned transcript unchanged (pruner-only no-op).
 
         After compression, orphaned tool_call / tool_result pairs are cleaned
         up so the API never receives mismatched IDs.

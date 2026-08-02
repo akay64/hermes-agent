@@ -797,19 +797,36 @@ class TestTailBudgetCodexReplayFields:
             {"role": "user", "content": "older follow-up"},
             big_hidden_message,
         ]
+        # Visible tail sized so it does NOT exhaust the budget on its own
+        # (8 × ~15 tokens < 150): the hidden-field message is what pushes
+        # the walk over the raw budget, so the cut position proves the
+        # hidden fields are counted.
         messages.extend(
             {
                 "role": "user" if i % 2 == 0 else "assistant",
                 "content": f"tail visible message {i}",
             }
-            for i in range(14)
+            for i in range(8)
         )
 
         cut_idx = c._find_tail_cut_by_tokens(messages, head_end=1, token_budget=150)
 
-        assert cut_idx == 5
+        # With the hidden fields, the cut lands ON the hidden message
+        # (index 4) — the tail starts there and the fields are counted.
+        assert cut_idx == 4, f"hidden replay fields must move the cut, got {cut_idx}"
         assert messages[4]["codex_reasoning_items"][0]["encrypted_content"].startswith("enc_")
         assert messages[4]["codex_message_items"][0]["content"][0]["text"].startswith("reply ")
+
+        # Control: the SAME transcript without the hidden fields leaves the
+        # visible tail well inside the budget, so the walk reaches further
+        # back and the cut lands earlier — proving the fields, not the
+        # visible tail, determined the cut above.
+        plain_messages = [dict(m) for m in messages]
+        plain_messages[4] = {"role": "assistant", "content": "ok"}
+        control_cut = c._find_tail_cut_by_tokens(plain_messages, head_end=1, token_budget=150)
+        assert control_cut < 4, (
+            f"control cut {control_cut} must differ from the hidden-field cut 4"
+        )
 
     @pytest.mark.parametrize(
         ("field_name", "field_value"),
@@ -851,15 +868,27 @@ class TestTailBudgetCodexReplayFields:
             {"role": "user", "content": "older follow-up"},
             hidden_message,
         ]
+        # Visible tail sized so it does NOT exhaust the budget on its own
+        # (8 × ~15 tokens < 150): the hidden field is what pushes the walk
+        # over the raw budget, so the cut position proves the field counts.
         messages.extend(
             {
                 "role": "user" if i % 2 == 0 else "assistant",
                 "content": f"tail visible message {i}",
             }
-            for i in range(14)
+            for i in range(8)
         )
 
-        assert c._find_tail_cut_by_tokens(messages, head_end=1, token_budget=150) == 5
+        assert c._find_tail_cut_by_tokens(messages, head_end=1, token_budget=150) == 4
+
+        # Control: identical transcript without the hidden field → the walk
+        # reaches further back and the cut lands earlier.
+        plain_messages = [dict(m) for m in messages]
+        plain_messages[4] = {"role": "assistant", "content": "ok"}
+        control_cut = c._find_tail_cut_by_tokens(plain_messages, head_end=1, token_budget=150)
+        assert control_cut < 4, (
+            f"control cut {control_cut} must differ from the hidden-field cut 4"
+        )
 
 
 class TestGenerateSummaryNoneContent:
@@ -2912,20 +2941,22 @@ class TestSummaryTargetRatio:
         assert c.tail_token_budget == 200_000
 
     def test_summary_cap_scales_with_context(self):
-        """Max summary tokens should be 5% of context, capped at 10K."""
+        """Max summary tokens should be 5% of context, capped at 16K."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
         assert c.max_summary_tokens == 10_000  # 200K * 0.05
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.max_summary_tokens == 10_000  # capped at 10K ceiling
+        assert c.max_summary_tokens == 16_000  # capped at 16K ceiling
 
-    def test_ratio_clamped(self):
-        """Ratio should be clamped to [0.10, 0.80]."""
+    def test_ratio_upper_clamp_only(self):
+        """Only the upper clamp remains: the 0.10 lower floor was removed
+        (the tail budget has a 3K token floor instead), so low ratios pass
+        through unchanged."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.05)
-        assert c.summary_target_ratio == 0.10
+        assert c.summary_target_ratio == 0.05  # no lower floor anymore
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.95)
@@ -4084,6 +4115,27 @@ class TestCompressionSimplification:
         assert result[1]["content"] == "THE ONLY ASK"
         assert all("CONTEXT COMPACTION" not in (m.get("content") or "") for m in result)
         assert c._ineffective_compression_count == 1
+
+    def test_has_content_to_compress_true_for_pruner_only_work(self):
+        """Empty-middle transcripts with prunable old tool results must pass
+        the manual /compress preflight: pruner-only compaction is useful
+        work (the only degradation available once the auto gate has
+        tripped)."""
+        c = self._compressor()
+        c.tail_token_budget = 500
+        msgs = [{"role": "user", "content": "IMPLEMENT PLAN: do the thing"}]
+        for i in range(6):
+            msgs.append({
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": f"c{i}", "type": "function",
+                                "function": {"name": "f", "arguments": "{}"}}],
+            })
+            msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "z" * 1500})
+        # Empty middle (single trigger), but the old tool results are prunable.
+        assert c.has_content_to_compress(msgs) is True
+        # A transcript with no middle AND nothing prunable → False.
+        tiny = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        assert c.has_content_to_compress(tiny) is False
 
     def test_two_ineffective_noops_trip_anti_thrash_gate(self):
         c = self._compressor()

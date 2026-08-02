@@ -97,7 +97,7 @@ auxiliary:
 | `threshold` | `0.50` | 0.0-1.0 | 当 prompt token 数 ≥ `threshold × context_length` 时触发压缩 |
 | `target_ratio` | `0.20` | 0.10-0.80 | 控制尾部保护 token 预算：`threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | 始终保留的最近消息最小数量 |
-| `protect_first_n` | `3` | （硬编码）| 系统提示词 + 首次交互始终保留 |
+| `protect_first_n` | 已移除 | — | 头部仅保留系统提示词；最后一条真实用户消息无条件锚定在受保护尾部 |
 
 ### 计算值（200K 上下文模型，默认参数）
 
@@ -128,9 +128,10 @@ max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
 ┌─────────────────────────────────────────────────────────────┐
 │  Message list                                               │
 │                                                             │
-│  [0..2]  ← protect_first_n (system + first exchange)        │
-│  [3..N]  ← middle turns → SUMMARIZED                        │
-│  [N..end] ← tail (by token budget OR protect_last_n)        │
+│  [0]      ← 仅系统提示词（protect_first_n 已移除）        │
+│  [1..N]   ← 中间轮次 → 被总结（可为空——此时仅执行剪枝） │
+│  [N..end] ← 尾部（按 token 预算或 protect_last_n；最后一条 │
+│             真实用户消息始终锚定在尾部）                  │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
