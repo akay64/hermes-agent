@@ -222,3 +222,44 @@ def test_codex_native_boundary_clears_stale_hermes_fallback_streak():
     assert _record_codex_app_server_compaction(agent, turn) is True
     assert compressor._fallback_compression_streak == 0
     assert compressor._verify_compaction_cleared_threshold is True
+
+
+def test_codex_native_boundary_clears_persisted_exact_usage(tmp_path):
+    from unittest.mock import patch
+
+    from agent.context_compressor import ContextCompressor
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        session_id = "codex-native-prompt-usage"
+        db.create_session(session_id, source="cli")
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100_000,
+        ):
+            compressor = ContextCompressor(
+                model="test-model",
+                provider="openai",
+                base_url="https://stub.invalid",
+                api_mode="codex_app_server",
+                quiet_mode=True,
+            )
+        compressor.bind_session_state(db, session_id)
+        compressor.update_from_response({"prompt_tokens": 50_000})
+        assert db.get_last_real_prompt_usage(session_id) is not None
+
+        agent = DummyAgent(
+            TurnResult(thread_id="thread-1", turn_id="native-boundary")
+        )
+        agent.context_compressor = compressor
+        turn = TurnResult(
+            thread_id="thread-1",
+            turn_id="native-boundary",
+            compacted=True,
+        )
+
+        assert _record_codex_app_server_compaction(agent, turn) is True
+        assert db.get_last_real_prompt_usage(session_id) is None
+    finally:
+        db.close()

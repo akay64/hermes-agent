@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import run_agent
+from agent.codex_runtime import _record_codex_app_server_usage
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 
 
@@ -135,6 +136,44 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_completion_tokens == 25
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000
+
+    def test_context_window_updates_before_shared_usage_ingestion(self):
+        agent = _make_codex_agent()
+        compressor = MagicMock()
+        compressor.context_length = 100_000
+        calls = []
+        compressor.update_model.side_effect = lambda **kwargs: calls.append(
+            ("update_model", kwargs)
+        )
+        compressor.update_from_response.side_effect = lambda usage: calls.append(
+            ("update_from_response", usage)
+        )
+        agent.context_compressor = compressor
+        turn = SimpleNamespace(
+            token_usage_last={
+                "totalTokens": 130,
+                "inputTokens": 80,
+                "cachedInputTokens": 20,
+                "outputTokens": 25,
+                "reasoningOutputTokens": 5,
+            },
+            model_context_window=200_000,
+        )
+
+        _record_codex_app_server_usage(agent, turn)
+
+        assert [name for name, _ in calls] == [
+            "update_model",
+            "update_from_response",
+        ]
+        assert calls[0][1]["context_length"] == 200_000
+        assert calls[1][1]["prompt_tokens"] == 100
+
+        compressor.reset_mock()
+        compressor.context_length = 200_000
+        _record_codex_app_server_usage(agent, turn)
+        compressor.update_model.assert_not_called()
+        compressor.update_from_response.assert_called_once()
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):

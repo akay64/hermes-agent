@@ -119,10 +119,22 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         try:
-            compressor.update_from_response(usage_dict)
             context_window = getattr(turn, "model_context_window", None)
-            if isinstance(context_window, int) and context_window > 0:
-                compressor.context_length = context_window
+            if (
+                isinstance(context_window, int)
+                and not isinstance(context_window, bool)
+                and context_window > 0
+                and context_window != getattr(compressor, "context_length", None)
+            ):
+                compressor.update_model(
+                    model=agent.model,
+                    context_length=context_window,
+                    base_url=agent.base_url,
+                    api_key=getattr(agent, "api_key", ""),
+                    provider=agent.provider,
+                    api_mode=agent.api_mode,
+                )
+            compressor.update_from_response(usage_dict)
         except Exception:
             logger.debug("codex app-server usage update failed", exc_info=True)
 
@@ -224,6 +236,13 @@ def _record_codex_app_server_compaction(
             compressor, "compression_count", 0
         ) + 1
         compressor.last_compression_rough_tokens = approx_tokens or 0
+        invalidate_prompt_usage = getattr(
+            compressor,
+            "_clear_last_real_prompt_usage",
+            None,
+        )
+        if callable(invalidate_prompt_usage):
+            invalidate_prompt_usage()
         # The app server has already completed a real compaction boundary. Its
         # usage update (when supplied) is therefore the same real-vs-real
         # effectiveness verdict used by the normal compression path.

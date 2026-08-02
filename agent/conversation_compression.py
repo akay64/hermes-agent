@@ -1284,6 +1284,13 @@ def compress_context(
                         _commit_guard()
                     agent._session_db.archive_and_compact(agent.session_id, compressed)
                     in_place_db_committed = True
+                    invalidate_prompt_usage = getattr(
+                        agent.context_compressor,
+                        "_clear_last_real_prompt_usage",
+                        None,
+                    )
+                    if callable(invalidate_prompt_usage):
+                        invalidate_prompt_usage()
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
                     # are passed as conversation_history next turn and skipped by
@@ -1415,6 +1422,13 @@ def compress_context(
                         for message in compressed
                         if isinstance(message, dict)
                     }
+                    invalidate_prompt_usage = getattr(
+                        agent.context_compressor,
+                        "_clear_last_real_prompt_usage",
+                        None,
+                    )
+                    if callable(invalidate_prompt_usage):
+                        invalidate_prompt_usage()
             except Exception as e:
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and

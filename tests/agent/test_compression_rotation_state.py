@@ -228,6 +228,7 @@ class TestFallbackStreakFollowsRotation:
                 quiet_mode=True,
             )
         compressor.bind_session_state(db, parent)
+        compressor.update_from_response({"prompt_tokens": 50_000})
         compressed = [
             {"role": "user", "content": "[CONTEXT COMPACTION] fallback"},
             {"role": "assistant", "content": "tail"},
@@ -250,6 +251,8 @@ class TestFallbackStreakFollowsRotation:
         child = getattr(agent, "session_id")
 
         assert child != parent
+        assert db.get_last_real_prompt_usage(parent) is None
+        assert db.get_last_real_prompt_usage(child) is None
         assert compressor._fallback_compression_streak == 1
         assert db.get_compression_fallback_streak(child) == 1
 

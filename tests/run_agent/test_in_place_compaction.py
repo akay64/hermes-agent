@@ -93,6 +93,7 @@ class TestInPlaceCompaction:
             sid = "in_place_summary_abort"
             _seed(db, sid, "abort")
             agent = _make_agent(db, sid, in_place=True)
+            agent.context_compressor.update_from_response({"prompt_tokens": 50_000})
             agent.context_compressor.abort_on_summary_failure = True
 
             def _abort(messages, current_tokens=None, focus_topic=None, force=False):
@@ -110,6 +111,7 @@ class TestInPlaceCompaction:
 
             assert compressed == messages
             assert db.get_messages(sid) == before
+            assert db.get_last_real_prompt_usage(sid) is not None
             assert agent._last_compaction_in_place is False
             assert agent._last_compaction_db_error is None
 
@@ -123,6 +125,7 @@ class TestInPlaceCompaction:
             sid = "in_place_db_failure"
             _seed(db, sid, "db-failure")
             agent = _make_agent(db, sid, in_place=True)
+            agent.context_compressor.update_from_response({"prompt_tokens": 50_000})
             before = db.get_messages(sid)
             messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
 
@@ -138,6 +141,7 @@ class TestInPlaceCompaction:
             archive.assert_called_once()
             assert compressed == messages
             assert db.get_messages(sid) == before
+            assert db.get_last_real_prompt_usage(sid) is not None
             assert agent._last_compaction_in_place is False
             assert "database is locked" in agent._last_compaction_db_error
 
@@ -180,6 +184,7 @@ class TestInPlaceCompaction:
             sid = "20260619_120000_aaaaaa"
             _seed(db, sid, "my-research")
             agent = _make_agent(db, sid, in_place=True)
+            agent.context_compressor.update_from_response({"prompt_tokens": 50_000})
             agent._last_flushed_db_idx = 5
 
             messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
@@ -189,6 +194,7 @@ class TestInPlaceCompaction:
 
             # Identity never moved.
             assert agent.session_id == sid
+            assert db.get_last_real_prompt_usage(sid) is None
             # No continuation row forked.
             child = db._conn.execute(
                 "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)

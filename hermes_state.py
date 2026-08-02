@@ -803,6 +803,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    last_real_prompt_usage_json TEXT,
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
@@ -2488,6 +2489,126 @@ class SessionDB:
                     "WHERE cwd = ? AND COALESCE(git_repo_root, '') = ''",
                     (root, cwd),
                 )
+
+        self._execute_write(_do)
+
+    def get_last_real_prompt_usage(
+        self,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the validated exact prompt-usage watermark for a session.
+
+        The watermark is deliberately stored as one JSON value because its
+        prompt count and runtime identity form one indivisible record. Invalid,
+        incomplete, or legacy data is treated as unavailable so callers can
+        conservatively fall back to rough estimation.
+        """
+        if not session_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_real_prompt_usage_json FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        raw = row["last_real_prompt_usage_json"] if isinstance(row, sqlite3.Row) else row[0]
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            record = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(record, dict):
+            return None
+
+        required_keys = {
+            "prompt_tokens",
+            "model",
+            "provider",
+            "base_url",
+            "api_mode",
+            "context_length",
+        }
+        if not required_keys.issubset(record):
+            return None
+
+        prompt_tokens = record["prompt_tokens"]
+        context_length = record["context_length"]
+        if (
+            isinstance(prompt_tokens, bool)
+            or not isinstance(prompt_tokens, int)
+            or prompt_tokens <= 0
+            or isinstance(context_length, bool)
+            or not isinstance(context_length, int)
+            or context_length <= 0
+        ):
+            return None
+        if not isinstance(record["model"], str) or not record["model"]:
+            return None
+        for key in ("provider", "base_url", "api_mode"):
+            if not isinstance(record[key], str):
+                return None
+
+        # Return only the contract fields so future metadata additions remain
+        # harmless to older readers.
+        return {
+            "prompt_tokens": prompt_tokens,
+            "model": record["model"],
+            "provider": record["provider"],
+            "base_url": record["base_url"],
+            "api_mode": record["api_mode"],
+            "context_length": context_length,
+        }
+
+    def set_last_real_prompt_usage(
+        self,
+        session_id: str,
+        prompt_tokens: int,
+        model: str,
+        provider: str,
+        base_url: str,
+        api_mode: str,
+        context_length: int,
+    ) -> None:
+        """Atomically persist one exact prompt-usage/runtime record.
+
+        This is an UPDATE-only accessor: it intentionally does not create a
+        session row when normal turn setup has not done so yet.
+        """
+        if not session_id:
+            return
+        payload = json.dumps(
+            {
+                "prompt_tokens": prompt_tokens,
+                "model": model,
+                "provider": provider,
+                "base_url": base_url,
+                "api_mode": api_mode,
+                "context_length": context_length,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET last_real_prompt_usage_json = ? WHERE id = ?",
+                (payload, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def clear_last_real_prompt_usage(self, session_id: str) -> None:
+        """Clear the exact prompt-usage watermark for a session."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET last_real_prompt_usage_json = NULL WHERE id = ?",
+                (session_id,),
+            )
 
         self._execute_write(_do)
 

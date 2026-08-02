@@ -385,6 +385,112 @@ class TestUpdateFromResponse:
         assert compressor.last_prompt_tokens == 0
         assert compressor.last_real_prompt_tokens == 0
 
+    @pytest.mark.parametrize("prompt_tokens", ["not-an-int", 1.5, True, -1])
+    def test_invalid_prompt_usage_restores_estimator_authority(
+        self,
+        compressor,
+        prompt_tokens,
+    ):
+        compressor.last_real_prompt_tokens = 5_000
+        compressor.update_from_response({"prompt_tokens": prompt_tokens})
+        assert compressor.last_prompt_tokens == 0
+        assert compressor.last_real_prompt_tokens == 0
+
+
+class TestPersistedRealPromptUsage:
+    _RUNTIME = {
+        "model": "test/model",
+        "provider": "test-provider",
+        "base_url": "https://provider.example/v1",
+        "api_mode": "chat_completions",
+        "context_length": 272_000,
+    }
+
+    def _compressor(self, db, session_id):
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=self._RUNTIME["context_length"],
+        ):
+            compressor = ContextCompressor(
+                model=self._RUNTIME["model"],
+                provider=self._RUNTIME["provider"],
+                base_url=self._RUNTIME["base_url"],
+                api_mode=self._RUNTIME["api_mode"],
+                config_context_length=self._RUNTIME["context_length"],
+                quiet_mode=True,
+            )
+        compressor.bind_session_state(db, session_id)
+        compressor.threshold_tokens = 244_800
+        return compressor
+
+    def test_reconstruction_hydrates_exact_usage_and_defers_preflight(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("same-session", source="cli")
+            first = self._compressor(db, "same-session")
+            first.update_from_response({"prompt_tokens": 218_505})
+
+            second = self._compressor(db, "same-session")
+            assert second.last_real_prompt_tokens == 218_505
+            assert second.should_defer_preflight_to_real_usage(245_621) is True
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("model", "other/model"),
+            ("provider", "other-provider"),
+            ("base_url", "https://other.example/v1"),
+            ("api_mode", "codex_responses"),
+            ("context_length", 300_000),
+        ],
+    )
+    def test_runtime_identity_mismatch_rejects_hydration(self, tmp_path, field, value):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("mismatch-session", source="cli")
+            first = self._compressor(db, "mismatch-session")
+            first.update_from_response({"prompt_tokens": 218_505})
+
+            second = self._compressor(db, "mismatch-session")
+            setattr(second, field, value)
+            second.bind_session_state(db, "mismatch-session")
+            assert second.last_real_prompt_tokens == 0
+            assert second.should_defer_preflight_to_real_usage(245_621) is False
+        finally:
+            db.close()
+
+    def test_usage_loss_clears_durable_state_before_reconstruction(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("usage-loss", source="cli")
+            first = self._compressor(db, "usage-loss")
+            first.update_from_response({"prompt_tokens": 218_505})
+            first.update_from_response({})
+
+            second = self._compressor(db, "usage-loss")
+            assert second.last_real_prompt_tokens == 0
+            assert second.should_defer_preflight_to_real_usage(245_621) is False
+        finally:
+            db.close()
+
+    def test_persistence_failure_does_not_break_live_usage(self, compressor):
+        class FailingDB:
+            def set_last_real_prompt_usage(self, *args):
+                raise RuntimeError("unavailable")
+
+            def clear_last_real_prompt_usage(self, *args):
+                raise RuntimeError("unavailable")
+
+        compressor.model = "test/model"
+        compressor.context_length = 100_000
+        compressor.bind_session_state(FailingDB(), "session")
+        compressor.update_from_response({"prompt_tokens": 5_000})
+        assert compressor.last_real_prompt_tokens == 5_000
+        compressor.update_from_response({})
+        assert compressor.last_real_prompt_tokens == 0
+
 class TestPreflightDeferral:
     def test_defers_when_recent_real_usage_fit(self, compressor):
         compressor.threshold_tokens = 85_000
@@ -3509,7 +3615,7 @@ class TestUpdateModelResetsCalibration:
         cooldown_until = time.monotonic() + 600
         comp._summary_failure_cooldown_until = cooldown_until
 
-        comp.update_model("big-model", context_length=128_000)
+        comp.update_model("big-model", context_length=200_000)
 
         assert comp._summary_failure_cooldown_until == cooldown_until
 

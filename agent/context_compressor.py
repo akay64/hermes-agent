@@ -1004,6 +1004,7 @@ class ContextCompressor(ContextEngine):
         """Bind the current session row so durable cooldowns can round-trip."""
         self._session_db = session_db
         self._session_id = session_id or ""
+        self.last_real_prompt_tokens = 0
         self._summary_failure_cooldown_until = 0.0
         self._cooldown_persist_failed = False
         self._last_summary_error = None
@@ -1011,6 +1012,99 @@ class ContextCompressor(ContextEngine):
         self._fallback_compression_streak = 0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
+        self._load_last_real_prompt_usage()
+
+    @staticmethod
+    def _runtime_identity_string(value: Any) -> str:
+        """Normalize optional runtime identity values for persistence."""
+        return "" if value is None else str(value)
+
+    def _runtime_identity(self) -> Dict[str, Any]:
+        return {
+            "model": self._runtime_identity_string(getattr(self, "model", "")),
+            "provider": self._runtime_identity_string(getattr(self, "provider", "")),
+            "base_url": self._runtime_identity_string(getattr(self, "base_url", "")),
+            "api_mode": self._runtime_identity_string(getattr(self, "api_mode", "")),
+            "context_length": getattr(self, "context_length", 0),
+        }
+
+    def _persist_last_real_prompt_usage(self) -> None:
+        """Best-effort persistence for the latest provider prompt reading."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        setter = getattr(session_db, "set_last_real_prompt_usage", None)
+        identity = self._runtime_identity()
+        prompt_tokens = getattr(self, "last_real_prompt_tokens", 0)
+        if (
+            not session_id
+            or not callable(setter)
+            or isinstance(prompt_tokens, bool)
+            or not isinstance(prompt_tokens, int)
+            or prompt_tokens <= 0
+            or not identity["model"]
+            or isinstance(identity["context_length"], bool)
+            or not isinstance(identity["context_length"], int)
+            or identity["context_length"] <= 0
+        ):
+            return
+        try:
+            setter(
+                session_id,
+                prompt_tokens,
+                identity["model"],
+                identity["provider"],
+                identity["base_url"],
+                identity["api_mode"],
+                identity["context_length"],
+            )
+        except sqlite3.Error as exc:
+            logger.debug("real prompt usage persist failed: %s", exc)
+        except Exception as exc:
+            logger.debug("real prompt usage persist failed (non-sqlite): %s", exc)
+
+    def _load_last_real_prompt_usage(self) -> None:
+        """Hydrate exact prompt usage only for the current runtime identity."""
+        self.last_real_prompt_tokens = 0
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_last_real_prompt_usage", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            record = getter(session_id)
+        except sqlite3.Error as exc:
+            logger.debug("real prompt usage lookup failed: %s", exc)
+            return
+        except Exception as exc:
+            logger.debug("real prompt usage lookup failed (non-sqlite): %s", exc)
+            return
+        if not isinstance(record, dict):
+            return
+        identity = self._runtime_identity()
+        if any(record.get(key) != identity[key] for key in identity):
+            return
+        prompt_tokens = record.get("prompt_tokens")
+        if (
+            isinstance(prompt_tokens, bool)
+            or not isinstance(prompt_tokens, int)
+            or prompt_tokens <= 0
+        ):
+            return
+        self.last_real_prompt_tokens = prompt_tokens
+
+    def _clear_last_real_prompt_usage(self) -> None:
+        """Best-effort invalidation of the bound session's exact reading."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        clearer = getattr(session_db, "clear_last_real_prompt_usage", None)
+        if not session_id or not callable(clearer):
+            return
+        try:
+            clearer(session_id)
+        except sqlite3.Error as exc:
+            logger.debug("real prompt usage clear failed: %s", exc)
+        except Exception as exc:
+            logger.debug("real prompt usage clear failed (non-sqlite): %s", exc)
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -1218,6 +1312,7 @@ class ContextCompressor(ContextEngine):
             provider != self.provider,
             base_url != self.base_url,
             api_mode != self.api_mode,
+            context_length != self.context_length,
         ))
         self.model = model
         self.base_url = base_url
@@ -1277,6 +1372,7 @@ class ContextCompressor(ContextEngine):
         if runtime_changed:
             self._fallback_compression_streak = 0
             self._persist_fallback_compression_streak()
+            self._clear_last_real_prompt_usage()
             # Failure cooldowns are scoped to the model/provider that failed.
             # A switch must give the new runtime an immediate summary attempt.
             self._clear_compression_failure_cooldown()
@@ -1543,11 +1639,29 @@ class ContextCompressor(ContextEngine):
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
-        self.last_completion_tokens = usage.get("completion_tokens", 0)
-        self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
-        if self.last_prompt_tokens > 0:
+        def _coerce_usage_count(value: Any) -> int:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return 0
+            return value
+
+        self.last_prompt_tokens = _coerce_usage_count(usage.get("prompt_tokens", 0))
+        self.last_completion_tokens = _coerce_usage_count(
+            usage.get("completion_tokens", 0)
+        )
+        reported_total = usage.get("total_tokens")
+        self.last_total_tokens = (
+            _coerce_usage_count(reported_total)
+            if reported_total is not None
+            else self.last_prompt_tokens + self.last_completion_tokens
+        )
+        prompt_tokens_valid = (
+            isinstance(self.last_prompt_tokens, int)
+            and not isinstance(self.last_prompt_tokens, bool)
+            and self.last_prompt_tokens > 0
+        )
+        if prompt_tokens_valid:
             self.last_real_prompt_tokens = self.last_prompt_tokens
+            self._persist_last_real_prompt_usage()
             if self.last_prompt_tokens < self.threshold_tokens:
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
                     self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
@@ -1596,6 +1710,7 @@ class ContextCompressor(ContextEngine):
             # Restore estimator authority on both trigger gates.
             self.last_real_prompt_tokens = 0
             self.last_rough_tokens_when_real_prompt_fit = 0
+            self._clear_last_real_prompt_usage()
         # Consume the pending-verification flag once real usage arrives, whether
         # or not prompt_tokens was reported, so a usage-less response can't leave
         # it armed for a later, unrelated reading.

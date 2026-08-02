@@ -98,6 +98,135 @@ class TestSessionLifecycle:
     def test_get_nonexistent_session(self, db):
         assert db.get_session("nonexistent") is None
 
+    def test_last_real_prompt_usage_round_trip_and_clear(self, db):
+        db.create_session("prompt-usage", source="cli")
+
+        db.set_last_real_prompt_usage(
+            "prompt-usage",
+            218_505,
+            "test-model",
+            "test-provider",
+            "https://provider.example/v1",
+            "chat_completions",
+            272_000,
+        )
+
+        assert db.get_last_real_prompt_usage("prompt-usage") == {
+            "prompt_tokens": 218_505,
+            "model": "test-model",
+            "provider": "test-provider",
+            "base_url": "https://provider.example/v1",
+            "api_mode": "chat_completions",
+            "context_length": 272_000,
+        }
+
+        db.clear_last_real_prompt_usage("prompt-usage")
+        assert db.get_last_real_prompt_usage("prompt-usage") is None
+
+    def test_last_real_prompt_usage_does_not_create_session(self, db):
+        db.set_last_real_prompt_usage(
+            "missing",
+            10,
+            "model",
+            "provider",
+            "base-url",
+            "mode",
+            100,
+        )
+        assert db.get_session("missing") is None
+        assert db.get_last_real_prompt_usage("missing") is None
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            "not-json",
+            {"prompt_tokens": 1},
+            {
+                "prompt_tokens": 0,
+                "model": "model",
+                "provider": "provider",
+                "base_url": "",
+                "api_mode": "",
+                "context_length": 100,
+            },
+            {
+                "prompt_tokens": True,
+                "model": "model",
+                "provider": "provider",
+                "base_url": "",
+                "api_mode": "",
+                "context_length": 100,
+            },
+            {
+                "prompt_tokens": 1,
+                "model": "model",
+                "provider": "provider",
+                "base_url": "",
+                "api_mode": "",
+                "context_length": False,
+            },
+            {
+                "prompt_tokens": 1,
+                "model": "",
+                "provider": "provider",
+                "base_url": "",
+                "api_mode": "",
+                "context_length": 100,
+            },
+            {
+                "prompt_tokens": 1,
+                "model": "model",
+                "provider": None,
+                "base_url": "",
+                "api_mode": "",
+                "context_length": 100,
+            },
+        ],
+    )
+    def test_last_real_prompt_usage_rejects_invalid_records(self, db, record):
+        db.create_session("invalid-prompt-usage", source="cli")
+        raw = json.dumps(record)
+
+        def _write(conn):
+            conn.execute(
+                "UPDATE sessions SET last_real_prompt_usage_json = ? WHERE id = ?",
+                (raw, "invalid-prompt-usage"),
+            )
+
+        db._execute_write(_write)
+        assert db.get_last_real_prompt_usage("invalid-prompt-usage") is None
+
+    def test_last_real_prompt_usage_ignores_unknown_keys(self, db):
+        db.create_session("extra-prompt-usage", source="cli")
+        record = {
+            "prompt_tokens": 1,
+            "model": "model",
+            "provider": "provider",
+            "base_url": "",
+            "api_mode": "",
+            "context_length": 100,
+            "future_field": {"version": 2},
+        }
+
+        def _write(conn):
+            conn.execute(
+                "UPDATE sessions SET last_real_prompt_usage_json = ? WHERE id = ?",
+                (json.dumps(record), "extra-prompt-usage"),
+            )
+
+        db._execute_write(_write)
+        assert db.get_last_real_prompt_usage("extra-prompt-usage") == {
+            key: record[key]
+            for key in (
+                "prompt_tokens",
+                "model",
+                "provider",
+                "base_url",
+                "api_mode",
+                "context_length",
+            )
+        }
+
     def test_create_session_enriches_null_metadata_on_conflict(self, db):
         """Gateway creates a bare row first; the agent's later create_session
         must backfill model/model_config/system_prompt without clobbering the
@@ -3950,6 +4079,21 @@ class TestSchemaInit:
             for r in migrated_db._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
         assert "reasoning_content" in msg_cols
+        session_cols = {
+            r[1]
+            for r in migrated_db._conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        assert "last_real_prompt_usage_json" in session_cols
+        migrated_db.set_last_real_prompt_usage(
+            "s1",
+            123,
+            "legacy-model",
+            "legacy-provider",
+            "",
+            "chat_completions",
+            1000,
+        )
+        assert migrated_db.get_last_real_prompt_usage("s1")["prompt_tokens"] == 123
 
         # The query that used to crash must now work
         cursor = migrated_db._conn.execute(
