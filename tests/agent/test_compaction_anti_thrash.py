@@ -281,7 +281,10 @@ class TestFutilityGuard:
         every should_compress() reading.
         """
         cc = _compressor(threshold_tokens=24_576)
-        msgs = _messages(14)
+        # Transcript must exceed the soft ceiling so compress() actually runs
+        # (a fitting transcript is now a legitimate no-op that would add a
+        # compress-time strike before the real-usage verdict).
+        msgs = _messages(14, size=2500)
 
         assert cc.should_compress(33_564)
         cc.compress(msgs, current_tokens=33_564)

@@ -331,6 +331,22 @@ _HISTORICAL_TASK_SECTION_RE = re.compile(
     rf"(?ms)^{re.escape(HISTORICAL_TASK_HEADING)}\s*\n.*?(?=^## |\Z)"
 )
 
+# Base64 payloads must never reach the summarizer input (see
+# _strip_base64_blobs): they carry no semantic value, flood the aux window,
+# and make the full-fidelity gate's char-based token estimate dangerously
+# wrong (dense base64 tokenizes at ~1-2.5 chars/token vs the 4 chars/token
+# estimate).  Two shapes: (a) data:image/...;base64, URLs — stripped at ANY
+# length; (b) bare base64-alphabet runs of >= 200 chars — mirroring the
+# pruner's image-payload threshold; shorter runs stay untouched by design.
+_BASE64_DATA_URL_RE = re.compile(
+    r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+"
+)
+_BASE64_BARE_RUN_RE = re.compile(r"[A-Za-z0-9+/]{200,}={0,2}")
+# HTTP(S) URL spans are preserved by _strip_base64_blobs — a long
+# alphanumeric path/query component inside a URL is a reusable reference,
+# not a blob.
+_HTTP_URL_SPAN_RE = re.compile(r"https?://[^\s<>\"']+")
+
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
     value = value.strip()
@@ -671,6 +687,48 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
         changed = True
 
     return result if changed else messages
+
+
+def _base64_label(match: "re.Match[str]") -> str:
+    return f"[base64 payload: {len(match.group(0))} chars]"
+
+
+def _strip_base64_blobs(text: str) -> str:
+    """Replace base64 payloads with short labels for the summarizer input.
+
+    Full fidelity means *textual* fidelity: base64 blobs (browser screenshots,
+    computer-use captures, image-gen output) have zero semantic value to the
+    summarizer, flood its input window, and skew the full-fidelity gate's
+    char-based token estimate (dense base64 tokenizes at ~1-2.5 chars/token
+    vs the 4 chars/token estimate, so the gate can undercount by 1.5-3x and
+    pass a prompt that overflows the aux context).
+
+    Handles two shapes:
+
+      (a) ``data:image/...;base64,`` payloads — stripped at ANY length;
+      (b) bare base64-alphabet runs of >= 200 chars — mirroring the pruner's
+          image-payload threshold.  Shorter runs are untouched by design;
+          very long base64-like identifiers in prose are the accepted
+          false-positive of this heuristic.
+
+    HTTP(S) URL spans are preserved intact: a long alphanumeric path/query
+    component inside a URL is a reusable reference and must not be labelled
+    as a blob.
+    """
+    if not text:
+        return text
+    text = _BASE64_DATA_URL_RE.sub(_base64_label, text)
+
+    # Bare runs, URL-span-aware: apply the blob regex only to the segments
+    # between HTTP(S) URLs, keeping the URLs themselves verbatim.
+    parts: List[str] = []
+    last = 0
+    for m in _HTTP_URL_SPAN_RE.finditer(text):
+        parts.append(_BASE64_BARE_RUN_RE.sub(_base64_label, text[last:m.start()]))
+        parts.append(m.group(0))
+        last = m.end()
+    parts.append(_BASE64_BARE_RUN_RE.sub(_base64_label, text[last:]))
+    return "".join(parts)
 
 
 def _image_part_label(part: Dict[str, Any]) -> str:
@@ -1330,7 +1388,16 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.threshold_percent = threshold_percent
-        self.protect_first_n = protect_first_n
+        # ``protect_first_n`` is retired as a behavioral mechanism (compression
+        # simplification): the head is the system prompt only, and the last
+        # real user message is unconditionally anchored in the tail.  The
+        # constructor parameter is retained for call compatibility
+        # (agent_init, test fixtures, ContextEngine ABC contract) but the
+        # built-in never consults the value — normalize the attribute so
+        # downstream preflight consumers (turn_context preflight,
+        # context_switch_guard) compute ``protect_last_n + 1`` rather than the
+        # old head count.
+        self.protect_first_n = 0
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = min(summary_target_ratio, 0.80)
         self.quiet_mode = quiet_mode
@@ -1905,6 +1972,12 @@ class ContextCompressor(ContextEngine):
             if role == "assistant" and content:
                 content = strip_think_blocks(None, content)
 
+            # Base64 payloads never enter the summarizer input (see
+            # _strip_base64_blobs) — applies to every role and both
+            # serialization modes, before any truncation so the label lands
+            # and the bounded budget goes to real content.
+            content = _strip_base64_blobs(content)
+
             # Tool results: keep enough content for the summarizer
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
@@ -1924,7 +1997,9 @@ class ContextCompressor(ContextEngine):
                         if isinstance(tc, dict):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
-                            args = redact_sensitive_text(fn.get("arguments", ""))
+                            args = _strip_base64_blobs(
+                                redact_sensitive_text(fn.get("arguments", ""))
+                            )
                             # Truncate long arguments but keep enough for context
                             if not full_fidelity and len(args) > self._TOOL_ARGS_MAX:
                                 args = args[:self._TOOL_ARGS_HEAD] + "..."
@@ -3078,47 +3153,28 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
             idx += 1
         return idx
 
-    def _effective_protect_first_n(self) -> int:
-        """``protect_first_n`` decayed across compression cycles.
-
-        ``protect_first_n`` keeps the first N non-system messages verbatim so
-        the original task framing survives the FIRST compaction. But applying
-        it on every subsequent pass fossilizes those early turns — they're
-        re-copied into each child session and never summarized away, so old
-        user messages become immortal and grow the head unboundedly across a
-        long session (#11996). Once the session has been compressed at least
-        once, the early turns are already captured in the handoff summary, so
-        there's no need to keep re-protecting them: decay to 0 (the system
-        prompt is still always protected separately by _protect_head_size).
-        """
-        if self.compression_count >= 1 or self._previous_summary:
-            return 0
-        return self.protect_first_n
-
     def _protect_head_size(self, messages: List[Dict[str, Any]]) -> int:
         """Total count of head messages to protect.
 
-        ``protect_first_n`` is defined as *additional* messages protected
-        beyond the system prompt.  The system prompt (if present at index 0)
-        is always implicitly protected — it's load-bearing context that
-        must never be summarised away.  This keeps semantics stable across
-        call paths where the system prompt may or may not be included in
-        the ``messages`` list (e.g. the gateway ``/compress`` handler
+        The head is the system prompt only.  ``protect_first_n`` was removed
+        as a behavioral mechanism, so no non-system message is ever protected
+        from summarization on the basis of position alone — the last real
+        user message is instead anchored in the tail unconditionally (see
+        ``_ensure_last_user_message_in_tail``).  The system prompt (if
+        present at index 0) is always protected — it's load-bearing context
+        that must never be summarised away.  This keeps semantics stable
+        across call paths where the system prompt may or may not be included
+        in the ``messages`` list (e.g. the gateway ``/compress`` handler
         strips it before calling compress()).
 
-        The ``protect_first_n`` portion DECAYS after the first compression
-        (see _effective_protect_first_n) so early user turns don't fossilize
-        across repeated compactions (#11996).
-
-        Examples (first compaction):
-          protect_first_n=0 → system prompt only (or nothing if no system msg)
-          protect_first_n=3 → system + first 3 non-system messages
-        After the first compaction: system prompt only.
+        The constructor still accepts ``protect_first_n`` for call
+        compatibility, but the built-in normalizes it to 0 and never
+        consults it, so this method always returns 0 or 1 (system-only).
         """
         head = 0
         if messages and messages[0].get("role") == "system":
             head = 1
-        return head + self._effective_protect_first_n()
+        return head
 
     def _align_boundary_backward(self, messages: List[Dict[str, Any]], idx: int) -> int:
         """Pull a compress-end boundary backward to avoid splitting a
@@ -3285,21 +3341,19 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
         the active context, causing the agent to stall, repeat completed work,
         or silently drop the user's latest request.
 
-        Fix: if the last user-role message is not already in the tail
-        (``messages[cut_idx:]``), walk ``cut_idx`` back to include it.  We
-        then re-align backward one more time to avoid splitting any
-        tool_call/result group that immediately precedes the user message.
+        The anchor is UNCONDITIONAL: the last real user message always lands
+        in the tail, with no clamp and no turn-pair exception.  A user message
+        sitting exactly at ``head_end`` (the first compressible index — e.g.
+        the triggering message of a single-trigger session) yields an empty
+        middle region, which the caller treats as a legitimate no-op (the
+        pruner still runs; no summary is produced).  The cut never passes the
+        user message, so the #22523 split/re-execution bug class cannot
+        recur: the turn-pair is kept intact in the tail instead of being
+        split across the boundary.
 
-        Causal Coupling guard (#22523): the final ``max(last_user_idx,
-        head_end + 1)`` clamp can push the cut *past* the user message when
-        the user sits at ``head_end`` (the first compressible index) — the
-        only case where ``head_end + 1 > last_user_idx``.  That splits the
-        turn-pair: the user lands in the compressed region without its
-        assistant reply, so the summariser records it as a pending ask and
-        the next session re-executes the already-completed task.  When this
-        split is unavoidable, push the cut *forward* to ``pair_end`` so the
-        full pair (user + reply + tool results) is summarised together and
-        correctly marked as completed.
+        ``_find_last_user_message_idx`` already guarantees the returned index
+        is >= ``head_end``, so the anchor is monotonic with respect to the
+        head — the tail can only grow, never shrink.
         """
         last_user_idx = self._find_last_user_message_idx(messages, head_end)
         if last_user_idx < 0:
@@ -3323,51 +3377,7 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
                 last_user_idx,
                 cut_idx,
             )
-        # Safety: never go back into the head region.
-        adjusted = max(last_user_idx, head_end + 1)
-        if adjusted > last_user_idx:
-            # The clamp would leave the user in the compressed region without
-            # its reply.  Keep the pair intact by pushing the cut forward past
-            # the whole (user + assistant + tool results) turn-pair so it is
-            # summarised as a completed unit rather than a dangling ask.
-            pair_end = self._find_turn_pair_end(messages, last_user_idx)
-            if not self.quiet_mode:
-                logger.debug(
-                    "Causal Coupling: cut would split turn-pair at user %d; "
-                    "pushing cut forward to pair_end %d so the completed pair "
-                    "is summarised together (#22523)",
-                    last_user_idx,
-                    pair_end,
-                )
-            return max(pair_end, head_end + 1)
-        return adjusted
-
-    def _find_turn_pair_end(
-        self,
-        messages: List[Dict[str, Any]],
-        user_idx: int,
-    ) -> int:
-        """Return the index *after* the complete turn-pair starting at *user_idx*.
-
-        A turn-pair is: ``user`` -> ``assistant`` [-> zero-or-more ``tool``
-        results].  Returns the index of the first message that does *not*
-        belong to the pair, i.e. the natural cut point that keeps the pair
-        intact on one side of the boundary.
-
-        If *user_idx* is the last message (no assistant reply yet), returns
-        ``user_idx + 1`` so the user message itself is minimally covered.
-        """
-        n = len(messages)
-        idx = user_idx + 1
-        if idx >= n:
-            return idx  # user is the very last message — no reply yet
-        if messages[idx].get("role") != "assistant":
-            return idx  # no assistant reply immediately following
-        idx += 1
-        # Include any tool results that belong to this assistant turn.
-        while idx < n and messages[idx].get("role") == "tool":
-            idx += 1
-        return idx
+        return last_user_idx
 
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
@@ -3383,12 +3393,13 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
         Token budget is the primary criterion.  A bounded message-count floor
         keeps a short run of recent turns verbatim even when the budget is
         exhausted, but the budget is allowed to exceed by up to 1.5x to avoid
-        cutting inside an oversized message (tool output, file read, etc.). If
-        even that floor exceeds 1.5x the budget, the cut is placed right after
-        the head so compression still runs.
+        cutting inside an oversized message (tool output, file read, etc.).
 
         Never cuts inside a tool_call/result group.  Always ensures the most
         recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
+        An empty middle region (cut at ``head_end``) is a legitimate outcome —
+        the caller treats ``compress_start >= compress_end`` as a no-op; the
+        pruner still runs, and the anti-thrashing counter owns loop-guarding.
         """
         if token_budget is None:
             token_budget = self.tail_token_budget
@@ -3445,17 +3456,12 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
                 raw_accumulated += raw_tok
                 cut_idx = j
             # If the raw-budget walk also consumed everything (very small
-            # transcript), fall through — the existing fallback logic below
-            # will still force a minimal cut after head_end.
+            # transcript), fall through — the boundary checks below yield an
+            # empty middle, which the caller treats as a legitimate no-op.
 
         # Ensure we protect at least min_tail messages
         fallback_cut = n - min_tail
         cut_idx = min(cut_idx, fallback_cut)
-
-        # If the token budget would protect everything (small conversations),
-        # force a cut after the head so compression can still remove middle turns.
-        if cut_idx <= head_end:
-            cut_idx = max(fallback_cut, head_end + 1)
 
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
@@ -3473,9 +3479,12 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
 
         # The floor guarantees forward progress — compression must always claim
         # at least one message or the caller's compress_start >= compress_end
-        # guard turns the pass into a no-op that re-runs forever (the same loop
-        # the soft-ceiling re-walk above guards against).  But raising
-        # cut_idx here discards the tool-group alignment computed above, and the
+        # guard turns the pass into a no-op.  An empty middle is now a
+        # legitimate outcome (single-trigger sessions where the anchored user
+        # message sits at the head boundary), so the cut may rest exactly at
+        # ``head_end``; the anti-thrashing counter in compress() owns the
+        # loop-guard role for repeated no-ops.  But raising cut_idx here
+        # discards the tool-group alignment computed above, and the
         # raised index can land *inside* a group: the parent
         # ``assistant(tool_calls)`` falls in the summarised region while its
         # ``tool`` results start the tail, and _sanitize_tool_pairs then drops
@@ -3483,7 +3492,7 @@ Within the limits of the active SOURCE QUALITY policy, PRIORITISE preserving inf
         # exists to prevent.  Re-align FORWARD (never backward, which would give
         # the floor's message back) so a raised cut skips to the end of the
         # group and the whole call/result pair is summarised together.
-        return self._align_boundary_forward(messages, max(cut_idx, head_end + 1))
+        return self._align_boundary_forward(messages, max(cut_idx, head_end))
 
     # ------------------------------------------------------------------
     # ContextEngine: manual /compress preflight

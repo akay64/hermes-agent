@@ -90,9 +90,15 @@ class TestFloorDoesNotSplitToolGroups:
         The floor used to land on the second group's ``tool`` result, leaving
         it orphaned in the tail while its parent was summarised away.
         """
+        # The head is system-only now, so the transcript must exceed the
+        # budget for a middle to exist: pin a small budget + small min-tail,
+        # and pad AFTER the groups so the walk breaks past them.
+        compressor.tail_token_budget = 500
+        compressor.protect_last_n = 2
         messages = [{"role": "system", "content": "sys"}]
         messages += _tool_group("call_1", results=2)
         messages += _tool_group("call_2", results=1, payload="IMPORTANT RESULT")
+        messages += [{"role": "assistant", "content": "p" * 1500} for _ in range(6)]
 
         start, end = _cut(compressor, messages)
 
@@ -140,10 +146,17 @@ class TestFloorDoesNotSplitToolGroups:
         ].get("tool_calls"), "cut must not sit between a tool_call and its result"
 
     def test_cut_still_makes_progress(self, compressor):
-        """The floor's purpose survives: compression always claims a message."""
+        """The floor's purpose survives: a transcript exceeding the budget
+        claims messages; a tiny one is now a legitimate no-op."""
+        # Pin a small budget so the small padded transcript still breaks the
+        # raw-budget re-walk (the 8K soft-ceiling floor would otherwise keep
+        # the whole thing protected).
+        compressor.tail_token_budget = 500
+        compressor.protect_last_n = 2
         messages = [{"role": "system", "content": "sys"}]
         messages += _tool_group("call_1", results=1)
         messages += _tool_group("call_2", results=1)
+        messages += [{"role": "assistant", "content": "p" * 1500} for _ in range(6)]
 
         start, end = _cut(compressor, messages)
 
@@ -161,17 +174,25 @@ class TestToolPairingInvariantAcrossShapes:
         offenders = []
         exercised = 0
 
+        # Pin a small budget so multi-block layouts exceed it (the 8K
+        # soft-ceiling floor would otherwise make every layout a no-op), and
+        # grow the block content so even 2-block layouts break the re-walk.
+        compressor.tail_token_budget = 500
+        compressor.protect_last_n = 2
+
         for n in range(2, 7):
             for layout in itertools.product(blocks, repeat=n):
                 messages = [{"role": "system", "content": "sys"}]
                 for i, b in enumerate(layout):
                     if b == "U":
-                        messages.append({"role": "user", "content": "u" * 60})
+                        messages.append({"role": "user", "content": "u" * 1200})
                     elif b == "A":
-                        messages.append({"role": "assistant", "content": "a" * 60})
+                        messages.append({"role": "assistant", "content": "a" * 1200})
                     else:
                         messages += _tool_group(
-                            f"call_{i}", results=1 if b == "T1" else 2
+                            f"call_{i}",
+                            results=1 if b == "T1" else 2,
+                            payload="r" * 1200,
                         )
 
                 start, end = _cut(compressor, messages)

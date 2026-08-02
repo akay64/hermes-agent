@@ -248,7 +248,11 @@ class TestCompressIntegration:
             {"role": "assistant", "content": "done"},
         ]
         # Bypass the real LLM summary — return a stub so compress() proceeds.
-        with patch.object(compressor, "_generate_summary", return_value="SUMMARY TEXT"):
+        # The boundary is pinned so the middle [1:7) (including the old
+        # image-bearing user turn) is what gets summarized; the newest
+        # image-bearing user turn stays in the tail.
+        with patch.object(compressor, "_generate_summary", return_value="SUMMARY TEXT"), \
+                patch.object(compressor, "_find_tail_cut_by_tokens", return_value=7):
             out = compressor.compress(msgs, current_tokens=60_000)
 
         # Newest user turn with image should still have it (it's in the tail).

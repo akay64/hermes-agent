@@ -267,11 +267,14 @@ def test_compress_passes_memory_context_with_auto_focus():
         {"role": "assistant", "content": "reply4"},
     ]
 
-    compressor.compress(
-        messages,
-        current_tokens=100_000,
-        memory_context="Checkpoint id: ctx-auto-focus",
-    )
+    # Pin the boundary so the small transcript has a middle (small
+    # transcripts are otherwise a legitimate no-op).
+    with patch.object(compressor, "_find_tail_cut_by_tokens", return_value=8):
+        compressor.compress(
+            messages,
+            current_tokens=100_000,
+            memory_context="Checkpoint id: ctx-auto-focus",
+        )
 
     assert received_kwargs["memory_context"] == "Checkpoint id: ctx-auto-focus"
     assert received_kwargs["focus_topic"].startswith("Recent user focus:")

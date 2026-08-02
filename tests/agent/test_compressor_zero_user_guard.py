@@ -106,21 +106,25 @@ class TestCompressAlwaysKeepsAUserTurn:
         )
 
     def test_summary_pinned_to_user_when_no_user_survives(self, compressor):
-        """When the whole compressible region is assistant/tool and no
-        user message survives in head or tail, the inserted summary
-        itself must be the user turn."""
+        """When no user message survives anywhere in the transcript, the
+        inserted summary itself must be the user turn.
+
+        The compression-simplification anchor keeps the last real user
+        message in the tail unconditionally, so the #58753 guard now fires
+        for genuinely user-less transcripts (pure assistant/tool streams) —
+        exactly what this test builds.
+        """
         from agent.context_compressor import (
             SUMMARY_PREFIX,
             COMPRESSED_SUMMARY_METADATA_KEY,
         )
 
         c = compressor
-        c.compression_count = 1
-        messages = [{"role": "user", "content": "work kanban task 7"}]
-        messages += _tool_turns(0, 12)
+        messages = _tool_turns(0, 12)  # no user messages at all
 
         mocked = f"{SUMMARY_PREFIX}\nsummary body"
-        with patch.object(c, "_generate_summary", return_value=mocked):
+        with patch.object(c, "_generate_summary", return_value=mocked), \
+                patch.object(c, "_find_tail_cut_by_tokens", return_value=len(messages) - 2):
             out = c.compress(messages, current_tokens=90_000)
 
         summary_rows = [m for m in out if m.get(COMPRESSED_SUMMARY_METADATA_KEY)]

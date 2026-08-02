@@ -112,7 +112,10 @@ def test_compress_passes_focus_to_generate_summary():
         {"role": "assistant", "content": "reply4"},
     ]
 
-    compressor.compress(messages, current_tokens=100000, focus_topic="authentication flow")
+    # Pin the boundary so the small transcript has a middle (small
+    # transcripts are otherwise a legitimate no-op).
+    with patch.object(compressor, "_find_tail_cut_by_tokens", return_value=8):
+        compressor.compress(messages, current_tokens=100000, focus_topic="authentication flow")
 
     assert received_kwargs.get("focus_topic") == "authentication flow"
 
@@ -141,7 +144,10 @@ def test_compress_none_focus_by_default():
         {"role": "assistant", "content": "reply4"},
     ]
 
-    compressor.compress(messages, current_tokens=100000)
+    # Pin the boundary so the small transcript has a middle (small
+    # transcripts are otherwise a legitimate no-op).
+    with patch.object(compressor, "_find_tail_cut_by_tokens", return_value=8):
+        compressor.compress(messages, current_tokens=100000)
 
     focus_topic = received_kwargs.get("focus_topic")
     assert focus_topic.startswith("Recent user focus:")

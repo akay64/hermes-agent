@@ -150,7 +150,7 @@ class TestTailCutRawBudgetFallback:
             summary_target_ratio=0.45,
             config_context_length=96000,
         )
-        messages = _build_session(20, words_per_turn=20)
+        messages = _build_session(20, words_per_turn=2000)
         head_end = comp._protect_head_size(messages)
         head_end = comp._align_boundary_forward(messages, head_end)
 
@@ -169,7 +169,9 @@ class TestTailCutRawBudgetFallback:
             summary_target_ratio=0.20,
             config_context_length=96000,
         )
-        messages = _build_session(20, words_per_turn=50)
+        # Sized between the raw budget (14.4K) and the soft ceiling (21.6K)
+        # so the #40803 raw-budget re-walk is what produces the cut.
+        messages = _build_session(20, words_per_turn=800)
         head_end = comp._protect_head_size(messages)
         head_end = comp._align_boundary_forward(messages, head_end)
 
@@ -180,10 +182,11 @@ class TestTailCutRawBudgetFallback:
             f"Expected head_end ({head_end}) < cut ({cut}) < n ({n})"
         )
 
-    def test_proactive_fix_prevents_no_op_window(self):
-        """The raw-budget fallback in _find_tail_cut_by_tokens should prevent
-        compress_start >= compress_end for the exact issue scenario:
-        context_length=96000, summary_target_ratio=0.45."""
+    def test_tiny_transcript_cut_is_head_end_noop(self):
+        """A transcript that fits within BOTH budgets is now a legitimate
+        no-op: the #40803 raw-budget re-walk falls through, and the old
+        force-cut (which used to push a minimal middle after head_end) is
+        gone.  The anti-thrashing counter owns the loop-guard role."""
         comp = _make_compressor(
             summary_target_ratio=0.45,
             config_context_length=96000,
@@ -195,10 +198,10 @@ class TestTailCutRawBudgetFallback:
 
         cut = comp._find_tail_cut_by_tokens(messages, head_end)
 
-        # With the fix, cut should be well past head_end
-        assert cut > head_end + 1, (
-            f"Expected cut ({cut}) > head_end ({head_end}) + 1, "
-            f"meaning the compressable window is non-trivial"
+        # No forced cut: the cut rests at the head — empty middle, no-op.
+        assert cut == head_end, (
+            f"Expected cut ({cut}) == head_end ({head_end}) — a fitting "
+            f"transcript is a legitimate no-op"
         )
 
 
@@ -215,7 +218,7 @@ class TestEffectiveCompressionResetsCounter:
             summary_target_ratio=0.20,
             config_context_length=96000,
         )
-        messages = _build_session(30, words_per_turn=100)
+        messages = _build_session(30, words_per_turn=2500)
         comp._generate_summary = MagicMock(return_value="Compacted summary of earlier turns.")
         comp.last_prompt_tokens = 73_000
 

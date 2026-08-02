@@ -42,7 +42,8 @@ def test_existing_previous_summary_is_not_serialized_again_as_new_turn():
     old_summary = "OLD-SUMMARY-BODY unique continuity facts"
     compressor._previous_summary = old_summary
 
-    with patch("agent.context_compressor.call_llm", return_value=_response("updated summary")) as mock_call:
+    with patch("agent.context_compressor.call_llm", return_value=_response("updated summary")) as mock_call, \
+            patch.object(compressor, "_find_tail_cut_by_tokens", return_value=6):
         compressor.compress(_messages_with_handoff(old_summary))
 
     prompt = mock_call.call_args.kwargs["messages"][0]["content"]
@@ -58,7 +59,8 @@ def test_resume_rehydrates_previous_summary_from_handoff_message():
     old_summary = "RESUMED-SUMMARY-BODY durable continuity facts"
     assert compressor._previous_summary is None
 
-    with patch("agent.context_compressor.call_llm", return_value=_response("updated summary")) as mock_call:
+    with patch("agent.context_compressor.call_llm", return_value=_response("updated summary")) as mock_call, \
+            patch.object(compressor, "_find_tail_cut_by_tokens", return_value=6):
         compressor.compress(_messages_with_handoff(old_summary))
 
     prompt = mock_call.call_args.kwargs["messages"][0]["content"]
@@ -79,11 +81,13 @@ def test_handoff_in_protected_head_populates_previous_summary_before_update():
         turns_to_summarize,
         focus_topic=None,
         memory_context="",
+        full_fidelity_turns=None,
     ):
         seen_turns.extend(turns_to_summarize)
         return "new summary from resumed turns"
 
-    with patch.object(compressor, "_generate_summary", side_effect=fake_generate_summary):
+    with patch.object(compressor, "_generate_summary", side_effect=fake_generate_summary), \
+            patch.object(compressor, "_find_tail_cut_by_tokens", return_value=6):
         compressor.compress(_messages_with_handoff(old_summary))
 
     assert compressor._previous_summary == old_summary

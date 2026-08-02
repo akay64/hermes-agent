@@ -96,7 +96,8 @@ def test_stale_previous_summary_cleared_when_no_handoff():
     messages = _conversation_without_handoff()
 
     with patch.object(c, "_generate_summary",
-                      return_value="[CONTEXT COMPACTION] Fresh summary."):
+                      return_value="[CONTEXT COMPACTION] Fresh summary."), \
+            patch.object(c, "_find_tail_cut_by_tokens", return_value=len(messages) - 2):
         result = c.compress(messages)
 
     assert c._previous_summary is None, (
