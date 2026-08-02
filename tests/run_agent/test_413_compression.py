@@ -1023,12 +1023,11 @@ class TestPreflightCompression:
             big_history.append({"role": "user", "content": f"Message {i} padded text"})
             big_history.append({"role": "assistant", "content": f"Response {i} padded text"})
 
-        ok_resp = _mock_response(
-            content="After preflight",
-            finish_reason="stop",
-            usage={"prompt_tokens": 144_669, "completion_tokens": 100, "total_tokens": 144_769},
-        )
-        agent.client.chat.completions.create.side_effect = [ok_resp]
+        def _provider_call(*_args, **_kwargs):
+            assert agent.context_compressor.last_prompt_tokens == 144_669
+            return _mock_response(content="After preflight", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _provider_call
 
         with (
             patch("agent.turn_context.estimate_request_tokens_rough", return_value=144_669),
@@ -1043,9 +1042,9 @@ class TestPreflightCompression:
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         assert result["completed"] is True
-        # The display token count was revised up to the fresh preflight estimate,
-        # not left at the stale 74_400.
-        assert agent.context_compressor.last_prompt_tokens == 144_669
+        # The display token count was revised up to the fresh preflight estimate
+        # before the provider call, then cleared because usage was omitted.
+        assert agent.context_compressor.last_prompt_tokens == 0
 
     def test_preflight_seed_only_revises_upward(self, agent):
         """A larger tracked value must not be clobbered by a smaller estimate."""
@@ -1060,12 +1059,11 @@ class TestPreflightCompression:
             big_history.append({"role": "user", "content": f"Message {i} padded text"})
             big_history.append({"role": "assistant", "content": f"Response {i} padded text"})
 
-        ok_resp = _mock_response(
-            content="After preflight",
-            finish_reason="stop",
-            usage={"prompt_tokens": 160_000, "completion_tokens": 100, "total_tokens": 160_100},
-        )
-        agent.client.chat.completions.create.side_effect = [ok_resp]
+        def _provider_call(*_args, **_kwargs):
+            assert agent.context_compressor.last_prompt_tokens == 160_000
+            return _mock_response(content="After preflight", finish_reason="stop")
+
+        agent.client.chat.completions.create.side_effect = _provider_call
 
         with (
             patch("agent.turn_context.estimate_request_tokens_rough", return_value=144_669),
@@ -1077,8 +1075,9 @@ class TestPreflightCompression:
         ):
             agent.run_conversation("hello", conversation_history=big_history)
 
-        # Smaller estimate must not overwrite the larger tracked value.
-        assert agent.context_compressor.last_prompt_tokens == 160_000
+        # The smaller estimate must not overwrite the larger tracked value
+        # before the provider call; usage-less freshness then clears it.
+        assert agent.context_compressor.last_prompt_tokens == 0
 
 
 class TestToolResultPreflightCompression:
