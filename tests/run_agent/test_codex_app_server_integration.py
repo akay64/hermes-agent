@@ -22,6 +22,24 @@ from agent.codex_runtime import _record_codex_app_server_usage
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 
 
+# DO NOT REMOVE THIS MODULE-LEVEL SKIP WITHOUT FIRST PROVING THAT EVERY TEST
+# PROVIDES A PROCESS-SAFE FAKE CODEX APP-SERVER BINARY AND AN ISOLATED CODEX_HOME.
+#
+# Despite the in-process monkeypatches below, running this module as part of the
+# full suite has spawned the user's real, authenticated Codex binary. One
+# observed run created 21 real Codex threads, issued 66 authenticated model
+# requests, consumed roughly 4 million recorded tokens, and polluted the user's
+# recent-chat history. Test processes must never inherit or exercise a user's
+# live Codex authentication or billing context. Keep the entire module
+# quarantined until the subprocess boundary is hermetic and regression-tested.
+pytestmark = pytest.mark.skip(
+    reason=(
+        "quarantined: can spawn authenticated Codex sessions and consume "
+        "real user billing/subscription usage"
+    )
+)
+
+
 @pytest.fixture
 def fake_session(monkeypatch):
     """Replace CodexAppServerSession with a stub that returns a fixed
@@ -825,4 +843,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-
